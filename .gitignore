@@ -1,0 +1,34 @@
+# Data & outputs
+data/*.duckdb
+data/*.duckdb.wal
+output/
+*.csv
+*.html
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tuned config (generated)
+config_tuned.yaml
+
+# Logs
+*.log

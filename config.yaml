@@ -1,0 +1,65 @@
+# ==================== 数据配置 ====================
+data:
+  db_path: "data/kline.duckdb"
+  ingest_since: "2025-04-01"          # 1年数据
+  baostock_workers: 4                  # 并发拉取进程数(降低以减少BaoStock断连)
+  retry: 3
+
+# ==================== 选股池 ====================
+universe:
+  min_listed_days: 60                  # 次新股排除阈值
+  exclude_st: true
+
+# ==================== 波动率门槛(PDF第一层筛选) ====================
+volatility:
+  amp30_min: 0.15                      # 30日最大涨跌幅绝对值 ≥ 15%
+  atr_pct_ratio: 1.5                   # ATR%当前 > 近90日均值 × 1.5 (波动正在扩张)
+  bb_width_quantile: 0.80              # 带宽 ≥ 近90日 80%分位 (高带宽)
+  lookback: 90                         # 历史回溯长度
+
+# ==================== 打分体系(满分9分) ====================
+# 每指标0-3分, BOLL+RSI+KDJ总分0-9分
+# 7-9: 强信号可建仓; 5-6: 弱信号轻仓; <5: 观望
+scoring:
+  threshold: 7                         # 仅入选强信号
+  require_all_dimensions: true         # 三指标必须都 ≥ 1 分(共振)
+  require_rsi_divergence: true         # RSI看涨底背离作为必要条件
+  rsi_long_oversold: 35                # RSI12 视为超卖的阈值(PDF推荐30,波动剧烈期可放宽到35)
+
+# ==================== 指标参数(用户指定) ====================
+indicators:
+  rsi_periods: [6, 12, 24]             # 短=6 / 中=12 / 长=24，评分用 6+12 双周期
+  kdj_period: 9
+  kdj_smooth: 3
+  boll_period: 14
+  boll_std: 2
+  atr_period: 14
+
+# ==================== 选股输出 ====================
+pick:
+  top_n: 50                            # 最多输出只数
+  output_dir: "output"
+
+# ==================== 回测配置 ====================
+backtest:
+  start_date: "2025-07-01"
+  end_date: "2026-04-25"
+  out_of_sample_start: "2025-04-01"
+  out_of_sample_end: "2025-06-30"
+  top_n: 20                            # 每期选股数
+  hold_periods: [5, 10, 20]           # 持有期(交易日)
+  benchmark: "sh.000300"              # 沪深300
+  # 达标门槛
+  pass_criteria:
+    hold10_excess_win_rate: 0.55       # 10日超额胜率
+    hold10_excess_return_mean: 0.015   # 10日平均超额收益
+    hold20_return_mean: 0.03           # 20日平均收益
+    hold20_max_loss: -0.25             # 20日最大单笔亏损
+    any_win_rate: 0.50                 # 任一持有期总胜率
+
+# ==================== 调参网格 ====================
+tuner:
+  amp30_candidates: [0.12, 0.15, 0.20]
+  score_threshold_candidates: [5, 6, 7]
+  atr_pct_ratio_candidates: [1.2, 1.5, 2.0]
+  bb_width_quantile_candidates: [0.6, 0.7, 0.8]
