@@ -93,12 +93,10 @@ def cmd_validate(cfg: dict, code: str = "sh.600519"):
 #  INGEST
 # ─────────────────────────────────────────────
 def cmd_ingest(cfg: dict, since: Optional[str] = None):
-    from src.universe import get_universe
-    from src.data_fetcher import ingest, get_db_stats
+    from src.data_fetcher import update_stock_data
 
-    print("\n=== STEP 2: Ingest full main board universe ===")
-    db_path = cfg["data"]["db_path"]
-    start = since or cfg["data"]["ingest_since"]
+    print("\n=== STEP 2: 增量更新 stock_data.db ===")
+    stock_db = cfg["data"].get("stock_data_db", "data/stock_data.db")
     today = datetime.today().strftime("%Y-%m-%d")
 
     print("Logging in to BaoStock ...")
@@ -107,22 +105,15 @@ def cmd_ingest(cfg: dict, since: Optional[str] = None):
         print(f"BaoStock login failed: {lg.error_msg}")
         sys.exit(1)
 
-    print("Building universe ...")
-    codes = get_universe(
-        min_listed_days=cfg["universe"]["min_listed_days"],
-        exclude_st=cfg["universe"]["exclude_st"],
-        db_path=db_path,
+    stats = update_stock_data(
+        db_path=stock_db,
+        end_date=since or today,
+        workers=cfg["data"].get("baostock_workers", 4),
+        retry=cfg["data"].get("retry", 3),
     )
-    print(f"Universe size: {len(codes)} stocks")
-
-    ingest(codes, db_path, start_date=start, end_date=today,
-           workers=cfg["data"]["baostock_workers"],
-           retry=cfg["data"]["retry"])
 
     bs.logout()
-
-    stats = get_db_stats(db_path)
-    print(f"\nDB stats: {stats}")
+    print(f"\n更新结果: {stats}")
 
 
 # ─────────────────────────────────────────────

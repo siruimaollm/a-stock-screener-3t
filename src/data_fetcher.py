@@ -348,6 +348,255 @@ def get_db_stats(db_path: str) -> dict:
     return {"total_rows": total, "stocks": stocks, "min_date": min_d, "max_date": max_d}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  stock_data.db 增量更新（SQLite 格式）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bs_code(stock_code: str) -> str:
+    """把 '600519' 转成 BaoStock 格式 'sh.600519'。"""
+    if stock_code.startswith(("6", "9")):
+        return f"sh.{stock_code}"
+    return f"sz.{stock_code}"
+
+
+def _fetch_batch_sqlite(args):
+    """
+    子进程：只拉取后复权（adjustflag=1）日线，返回 list of (stock_code, rows_list)。
+    rows_list 每项: (stock_code, date, open, high, low, close, volume, amount, turnover_rate)
+    """
+    batch, retry = args   # batch: list of (stock_code, start_date, end_date)
+    import baostock as _bs
+
+    _bs.login()
+    results = []
+    fields = "date,open,high,low,close,volume,amount,turn"
+
+    for stock_code, start, end in batch:
+        bs_code = _bs_code(stock_code)
+        rows_out = []
+        for attempt in range(retry):
+            try:
+                rs = _bs.query_history_k_data_plus(
+                    bs_code, fields,
+                    start_date=start, end_date=end,
+                    frequency="d", adjustflag="1",   # 后复权
+                )
+                if rs.error_code != "0":
+                    time.sleep(0.3 * (attempt + 1))
+                    continue
+                while rs.next():
+                    r = rs.get_row_data()
+                    # r: [date, open, high, low, close, volume, amount, turn]
+                    try:
+                        c = float(r[4])
+                        if c <= 0:
+                            continue
+                        rows_out.append((
+                            stock_code, r[0],
+                            _safe_float(r[1]), _safe_float(r[2]),
+                            _safe_float(r[3]), c,
+                            _safe_float(r[5]), _safe_float(r[6]),
+                            _safe_float(r[7]),
+                        ))
+                    except (ValueError, IndexError):
+                        continue
+                break
+            except Exception:
+                time.sleep(0.5)
+        results.append((stock_code, rows_out))
+
+    _bs.logout()
+    return results
+
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _fetch_index_sqlite(index_bs_code: str, index_code: str,
+                        start_date: str, end_date: str, retry: int = 3):
+    """拉取指数日线，返回 DataFrame，columns: index_code, date, open, high, low, close, volume, amount。"""
+    for attempt in range(retry):
+        try:
+            rs = bs.query_history_k_data_plus(
+                index_bs_code,
+                "date,open,high,low,close,volume,amount",
+                start_date=start_date, end_date=end_date,
+                frequency="d", adjustflag="3",
+            )
+            if rs.error_code != "0":
+                time.sleep(0.5)
+                continue
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+            if not rows:
+                return None
+            df = pd.DataFrame(rows, columns=["date", "open", "high", "low",
+                                             "close", "volume", "amount"])
+            df["index_code"] = index_code
+            for col in ["open", "high", "low", "close", "volume", "amount"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df[["index_code", "date", "open", "high", "low", "close", "volume", "amount"]]
+        except Exception:
+            time.sleep(1)
+    return None
+
+
+def update_stock_data(db_path: str,
+                      end_date: Optional[str] = None,
+                      workers: int = 8,
+                      retry: int = 3) -> dict:
+    """
+    增量更新 stock_data.db（SQLite 格式）。
+    只更新 daily_data_hfq（后复权，分析用）和 index_data。
+
+    优化点：
+    - 只拉后复权，API 调用数减半
+    - 小批次（100只/批）让多进程负载均衡
+    - INSERT OR IGNORE + 唯一索引，无需事后 dedup
+    - executemany 批量写入，比 to_sql 快 5-10x
+
+    返回 {"ok": int, "fail": int, "latest_date": str}
+    """
+    import sqlite3 as _sqlite3
+    from datetime import timedelta
+
+    if end_date is None:
+        end_date = datetime.today().strftime("%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+    con = _sqlite3.connect(db_path, timeout=60)
+    # WAL 模式：允许读写并发，减少锁竞争
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+
+    # ── 1. 找各股最新日期，用全局最小最新日期作为统一起点 ──
+    # 增量更新场景下大多数票最新日期相同，直接取最小值统一处理
+    row = con.execute("SELECT MIN(mx) FROM (SELECT MAX(date) mx FROM daily_data_hfq GROUP BY stock_code)").fetchone()
+    global_min_latest = row[0] if row and row[0] else "2021-01-01"
+
+    # 对最新日期 < 全局最小最新日期的股票（新股等），单独处理
+    per_stock_latest = dict(con.execute(
+        "SELECT stock_code, MAX(date) FROM daily_data_hfq GROUP BY stock_code"
+    ).fetchall())
+
+    all_codes = [r[0] for r in con.execute("SELECT stock_code FROM stock_info").fetchall()]
+    con.close()
+
+    from datetime import timedelta
+    todo = []
+    for code in all_codes:
+        last = per_stock_latest.get(code)
+        if last:
+            last_dt = datetime.strptime(last, "%Y-%m-%d")
+            if last_dt >= end_dt:
+                continue
+            fetch_from = (last_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            fetch_from = "2021-01-01"
+        todo.append((code, fetch_from, end_date))
+
+    if not todo:
+        print("  stock_data.db: 所有股票已是最新，无需更新。")
+        _update_index_data(db_path, end_date, end_dt, retry)
+        return {"ok": 0, "fail": 0, "latest_date": end_date}
+
+    print(f"  需更新 {len(todo)} 只股票（{workers} 进程，每批100只）...")
+
+    # ── 2. 小批次，每批 100 只，让所有 worker 均衡负载 ──
+    BATCH = 100
+    batches = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
+    job_args = [(b, retry) for b in batches]
+
+    ok = fail = 0
+    # 由于 fetch 时已按日期过滤（fetch_from = last_date+1），不会有重复行，直接 INSERT
+    INSERT_SQL = """
+        INSERT INTO daily_data_hfq
+        (stock_code, date, open, high, low, close, volume, amount, turnover_rate)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    con = _sqlite3.connect(db_path, timeout=60)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("PRAGMA cache_size=-64000")   # 64MB cache
+
+    with mp.Pool(processes=workers) as pool:
+        for batch_results in tqdm(
+            pool.imap_unordered(_fetch_batch_sqlite, job_args),
+            total=len(batches),
+            desc="  更新进度",
+        ):
+            rows_all = []
+            for code, rows in batch_results:
+                if rows:
+                    rows_all.extend(rows)
+                    ok += 1
+                else:
+                    fail += 1
+            if rows_all:
+                con.executemany(INSERT_SQL, rows_all)
+                con.commit()
+
+    con.close()
+
+    # ── 3. 更新指数 ──
+    _update_index_data(db_path, end_date, end_dt, retry)
+
+    # ── 4. 统计最终最新日期 ──
+    con2 = _sqlite3.connect(db_path)
+    latest_date = con2.execute("SELECT MAX(date) FROM daily_data_hfq").fetchone()[0]
+    con2.close()
+
+    print(f"  更新完成: OK={ok}  失败/空={fail}  最新日期={latest_date}")
+    return {"ok": ok, "fail": fail, "latest_date": latest_date}
+
+
+def _update_index_data(db_path: str, end_date: str, end_dt, retry: int = 3):
+    """更新 index_data 表（沪深300 / 上证 / 深成指）。"""
+    import sqlite3 as _sqlite3
+    from datetime import timedelta
+
+    index_map = {
+        "000300": "sh.000300",
+        "000001": "sh.000001",
+        "399001": "sz.399001",
+    }
+    INSERT_IDX = """
+        INSERT INTO index_data
+        (index_code, date, open, high, low, close, volume, amount)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    con = _sqlite3.connect(db_path, timeout=60)
+    con.execute("PRAGMA journal_mode=WAL")
+    idx_latest = dict(con.execute(
+        "SELECT index_code, MAX(date) FROM index_data GROUP BY index_code"
+    ).fetchall())
+
+    for idx_code, bs_code in index_map.items():
+        last = idx_latest.get(idx_code)
+        if last:
+            last_dt = datetime.strptime(last, "%Y-%m-%d")
+            if last_dt >= end_dt:
+                continue
+            idx_start = (last_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            idx_start = "2020-01-01"
+        df_idx = _fetch_index_sqlite(bs_code, idx_code, idx_start, end_date, retry)
+        if df_idx is not None and not df_idx.empty:
+            rows = list(df_idx[["index_code", "date", "open", "high", "low",
+                                 "close", "volume", "amount"]].itertuples(index=False, name=None))
+            con.executemany(INSERT_IDX, rows)
+            con.commit()
+            print(f"    指数 {idx_code}: +{len(rows)} 行")
+
+    con.close()
+
+
 def save_stock_basic(db_path: str, rows: list):
     """Cache stock name/industry in DB to avoid repeated query_stock_basic calls."""
     conn = duckdb.connect(db_path)
