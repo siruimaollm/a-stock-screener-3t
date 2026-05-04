@@ -154,13 +154,21 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
     vol_cfg = _build_vol_cfg(cfg)
     score_cfg = {"threshold": cfg["scoring"]["threshold"],
                  "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
-                 "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", True),
-                 "rsi_long_oversold": cfg["scoring"].get("rsi_long_oversold", 30)}
+                 "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
+                 "rsi_long_oversold": cfg["scoring"].get("rsi_long_oversold", 40)}
+    ind_cfg = {
+        "rsi_periods": cfg["indicators"]["rsi_periods"],
+        "kdj_period":  cfg["indicators"]["kdj_period"],
+        "kdj_smooth":  cfg["indicators"]["kdj_smooth"],
+        "boll_period": cfg["indicators"]["boll_period"],
+        "boll_std":    cfg["indicators"]["boll_std"],
+        "atr_period":  cfg["indicators"]["atr_period"],
+    }
 
     results = run_backtest(all_kline, bench_kline,
                            bt_cfg["start_date"], bt_cfg["end_date"],
                            hold_periods, bt_cfg["top_n"],
-                           vol_cfg, score_cfg)
+                           vol_cfg, score_cfg, ind_cfg)
 
     passed, failed = check_pass_criteria(results, pass_criteria)
     auto_tuned = False
@@ -338,6 +346,105 @@ def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = 
 
     print(f"\nDone. CSV: {csv_path}")
     print(f"HTML: {os.path.abspath(html_path)}")
+
+
+def cmd_backtest_v2(cfg: dict):
+    """v2 回测：TP=+10%或布林上轨，SL=破位-8%或持有1年。"""
+    from src.data_fetcher import load_all_kline_sqlite, load_benchmark_kline
+    from src.backtest_v2 import run_backtest_v2
+    from src.backtest_report import save_backtest_v2_html
+    from datetime import datetime as _dt, timedelta as _td
+
+    print("\n=== STEP 3 (v2): 优化版历史回测 ===")
+    stock_db = cfg["data"].get("stock_data_db", "data/stock_data.db")
+    bt_cfg = cfg["backtest"]
+
+    hist_start = (_dt.strptime(bt_cfg["start_date"], "%Y-%m-%d") - _td(days=220)).strftime("%Y-%m-%d")
+
+    print(f"加载行情 ({hist_start} ~ {bt_cfg['end_date']}) ...")
+    all_kline = load_all_kline_sqlite(stock_db, table="daily_data_hfq",
+                                      start_date=hist_start,
+                                      end_date=bt_cfg["end_date"])
+    print(f"  {len(all_kline):,} 行, {all_kline['code'].nunique()} 只股票")
+
+    bench_code = bt_cfg["benchmark"].split(".")[-1]
+    print(f"加载基准 {bench_code} ...")
+    bench_kline = load_benchmark_kline(stock_db, index_code=bench_code,
+                                       start_date=bt_cfg["start_date"],
+                                       end_date=bt_cfg["end_date"])
+
+    vol_cfg = _build_vol_cfg(cfg)
+    score_cfg = {
+        "threshold":              cfg["scoring"]["threshold"],
+        "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
+        "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
+        "rsi_long_oversold":      cfg["scoring"].get("rsi_long_oversold", 40),
+    }
+    ind_cfg = {
+        "rsi_periods": cfg["indicators"]["rsi_periods"],
+        "kdj_period":  cfg["indicators"]["kdj_period"],
+        "kdj_smooth":  cfg["indicators"]["kdj_smooth"],
+        "boll_period": cfg["indicators"]["boll_period"],
+        "boll_std":    cfg["indicators"]["boll_std"],
+        "atr_period":  cfg["indicators"]["atr_period"],
+    }
+    bt_v2_cfg = cfg.get("backtest_v2", {})
+    take_profit    = bt_v2_cfg.get("take_profit",    0.10)
+    break_down_pct = bt_v2_cfg.get("break_down_pct", 0.08)
+    max_hold       = bt_v2_cfg.get("max_hold",       252)
+    signal_freq    = bt_v2_cfg.get("signal_freq",    "biweekly")
+
+    result = run_backtest_v2(
+        all_kline, bench_kline,
+        bt_cfg["start_date"], bt_cfg["end_date"],
+        top_n=bt_cfg["top_n"],
+        vol_cfg=vol_cfg, score_cfg=score_cfg, ind_cfg=ind_cfg,
+        take_profit=take_profit, break_down_pct=break_down_pct,
+        max_hold=max_hold, signal_freq=signal_freq,
+    )
+
+    metrics = result["metrics"]
+    trades_df = result["trades"]
+
+    out_dir = cfg["pick"]["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    date_str = datetime.today().strftime("%Y%m%d")
+    out_html = os.path.join(out_dir, f"backtest_v2_{date_str}.html")
+    out_csv  = os.path.join(out_dir, f"backtest_v2_{date_str}_trades.csv")
+
+    if not trades_df.empty:
+        # 注入股票名称 / 行业（从 stock_info 表）
+        meta = _get_stock_meta(cfg)
+        trades_df = trades_df.copy()
+        # 确保 code 为 6 位字符串（防止 CSV 读取时丢失前导 0）
+        trades_df["code"] = trades_df["code"].astype(str).str.zfill(6)
+        trades_df["name"]     = trades_df["code"].map(lambda c: (meta.get(c, {}) or {}).get("name", ""))
+        trades_df["industry"] = trades_df["code"].map(lambda c: (meta.get(c, {}) or {}).get("industry", ""))
+        # 重新排序列：把 name/industry 放到 code 后面
+        cols = list(trades_df.columns)
+        if "code" in cols and "name" in cols:
+            cols.remove("name");  cols.insert(cols.index("code") + 1, "name")
+        if "industry" in cols:
+            cols.remove("industry"); cols.insert(cols.index("name") + 1, "industry")
+        trades_df = trades_df[cols]
+
+        trades_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+        save_backtest_v2_html(metrics, trades_df, out_html,
+                              bt_cfg["start_date"], bt_cfg["end_date"],
+                              meta=meta)
+
+    print()
+    print("=" * 56)
+    print(f"[v2] 总笔数={metrics.get('total_trades',0)}")
+    if metrics.get("total_trades", 0) > 0:
+        print(f"[v2] 胜率={metrics['win_rate']:.1%}  止盈={metrics['tp_rate']:.1%} (+10%:{metrics['tp_pct_rate']:.1%} 布林:{metrics['tp_boll_rate']:.1%})")
+        print(f"[v2] 破位止损={metrics['sl_rate']:.1%}  超时(1y)={metrics['timeout_rate']:.1%}")
+        print(f"[v2] 平均收益={metrics['mean_return']:.2%}  中位={metrics['median_return']:.2%}  最优={metrics['max_return']:.2%}  最差={metrics['min_return']:.2%}")
+        print(f"[v2] 超额胜率={metrics.get('exc_win_rate', 0):.1%}  平均超额={metrics.get('mean_excess', 0):.2%}")
+        print(f"[v2] 平均持有={metrics['mean_hold_days']:.1f} 日")
+        print(f"[v2] HTML报告: {out_html}")
+        print(f"[v2] 明细CSV : {out_csv}")
+    print("=" * 56)
 
 
 def cmd_backtest_tp(cfg: dict):
@@ -619,7 +726,7 @@ def _get_stock_meta(cfg: dict) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="A股主板反转选股策略")
     parser.add_argument("command", nargs="?",
-                        choices=["validate", "ingest", "backtest", "pick",
+                        choices=["validate", "ingest", "backtest", "backtest-v2", "pick",
                                  "backtest-tp", "backtest-vbt",
                                  "miao-data", "miao-search", "miao-xuangu"],
                         default=None)
@@ -641,6 +748,8 @@ def main():
         cmd_ingest(cfg, args.since)
     elif args.command == "backtest":
         cmd_backtest(cfg, args.auto_tune)
+    elif args.command == "backtest-v2":
+        cmd_backtest_v2(cfg)
     elif args.command == "pick":
         cmd_pick(cfg, args.date, args.top)
     elif args.command == "backtest-tp":

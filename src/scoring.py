@@ -217,13 +217,16 @@ def score_kdj(df: pd.DataFrame) -> tuple:
 
 def score_volume(df: pd.DataFrame) -> tuple:
     """
-    量价评分（0-3分）。
-    核心信号：量价出现明显止跌特征，多路径判定：
+    量价评分（0-3分）— 优化版（与三段波动率过滤协同）。
 
-    Path A（3分）: 连续3日量比严格递减 + 3日均值<0.75 + 收盘≥当日中轴(H+L)/2 + 5日未创收盘新低
-    Path B（3分）: 前3日量比均值<0.7后今日放量阳线（缩量整理后承接确认）
-    Path C（2分）: 今日量比<0.65 + 收盘≥当日中轴（单日明显缩量+收盘强势）
-    Path D（1分）: 5日均量比<0.85 + 收盘≥昨收×0.995（温和缩量价稳）
+    核心思路：股票通过波动率过滤已表明 10日均量 < 30日均量 ×0.80（中长期缩量），
+              此函数评估"近期"量价止跌特征是否进一步强化。
+
+    Path A（3分）: 连续3日量比严格递减 + 3日均值<0.85 + 收盘≥当日中轴(H+L)/2 + 5日未创收盘新低
+    Path B（3分）: 前3日量比均值<0.85后今日放量阳线（缩量整理后承接确认）
+    Path C（2分）: 今日量比<0.75 + 收盘≥当日中轴（单日明显缩量+收盘强势）
+    Path D（2分）: 5日均量比<0.95 + 收盘≥昨收×0.99 + 中长期缩量已确认（vol_ma5<vol_ma20）
+    Path E（1分）: 中长期缩量已确认（vol_ma5<vol_ma20×0.95）+ 价格稳定（5日波动<5%）
     """
     if "vol_ratio" not in df.columns or len(df) < 6:
         return 0, []
@@ -241,13 +244,17 @@ def score_volume(df: pd.DataFrame) -> tuple:
     if close_now is None or close_prev is None or high_now is None or low_now is None:
         return 0, []
 
-    # 价格止跌的严格定义：收盘在当日(H+L)/2以上（不只是未大跌）
     mid_price       = (high_now + low_now) / 2
     close_above_mid = close_now >= mid_price
 
-    # 5日内未创收盘新低（排除持续阴跌中的假缩量）
     past5_close_min = float(df["close"].iloc[-6:-1].min()) if len(df) >= 6 else close_now
     price_no_new_low = close_now >= past5_close_min
+
+    # 中长期缩量是否确认（vol_ma5 < vol_ma20）
+    vol_ma5_now  = float(last.get("vol_ma5",  np.nan)) if "vol_ma5"  in df.columns else np.nan
+    vol_ma20_now = float(last.get("vol_ma20", np.nan)) if "vol_ma20" in df.columns else np.nan
+    long_shrink = (not (pd.isna(vol_ma5_now) or pd.isna(vol_ma20_now))
+                   and vol_ma20_now > 0 and vol_ma5_now < vol_ma20_now)
 
     # 放量阴线直接归零（出货信号）
     if vr_now >= 1.5 and close_now < close_prev:
@@ -260,25 +267,33 @@ def score_volume(df: pd.DataFrame) -> tuple:
                     and vr_series[0] > vr_series[1] > vr_series[2])
     vr_3d_mean = float(df["vol_ratio"].iloc[-3:].mean())
 
-    if vr_declining and vr_3d_mean < 0.75 and close_above_mid and price_no_new_low:
+    if vr_declining and vr_3d_mean < 0.85 and close_above_mid and price_no_new_low:
         return 3, [f"持续缩量止跌(3日量比递减{vr_series[0]:.2f}→{vr_series[2]:.2f},均={vr_3d_mean:.2f},收≥中轴)"]
 
     # ── Path B：缩量整理后放量阳线确认 ──
     vr_prev3_mean = float(df["vol_ratio"].iloc[-4:-1].mean()) if len(df) >= 4 else np.nan
     if (not pd.isna(vr_prev3_mean)
-            and vr_prev3_mean < 0.7
-            and vr_now >= 1.1
+            and vr_prev3_mean < 0.85
+            and vr_now >= 1.05
             and close_now > close_prev):
         return 3, [f"缩量整理后放量阳线(前3日均={vr_prev3_mean:.2f}→今={vr_now:.2f}↑,收阳)"]
 
     # ── Path C：单日明显缩量+收盘强势 ──
-    if vr_now < 0.65 and close_above_mid:
+    if vr_now < 0.75 and close_above_mid:
         return 2, [f"单日明显缩量止跌(量比={vr_now:.2f},收{close_now:.2f}≥中轴{mid_price:.2f})"]
 
-    # ── Path D：温和缩量价稳 ──
+    # ── Path D：温和缩量价稳 + 中长期缩量确认（2分）──
     vr_5d_mean = float(df["vol_ratio"].iloc[-5:].mean())
-    if vr_5d_mean < 0.85 and close_now >= close_prev * 0.995:
-        return 1, [f"量缩价稳(5日均量比={vr_5d_mean:.2f})"]
+    if vr_5d_mean < 0.95 and close_now >= close_prev * 0.99 and long_shrink:
+        return 2, [f"中长期缩量确认+量价稳(5日均量比={vr_5d_mean:.2f},MA5/MA20={vol_ma5_now/vol_ma20_now:.2f})"]
+
+    # ── Path E：中长期缩量确认 + 价格稳定（1分）──
+    if long_shrink:
+        c5_max = float(df["close"].iloc[-5:].max())
+        c5_min = float(df["close"].iloc[-5:].min())
+        c5_mean = float(df["close"].iloc[-5:].mean())
+        if c5_mean > 0 and (c5_max - c5_min) / c5_mean < 0.05:
+            return 1, [f"中长期缩量+5日窄幅({(c5_max-c5_min)/c5_mean*100:.1f}%)"]
 
     return 0, []
 
