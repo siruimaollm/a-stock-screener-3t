@@ -251,19 +251,19 @@ def load_all_kline(db_path: str,
 
 def load_all_kline_sqlite(db_path: str,
                           table: str = "daily_data_hfq",
-                          start_date: str | None = None,
-                          end_date: str | None = None) -> pd.DataFrame:
+                          start_date: Optional[str] = None,
+                          end_date: Optional[str] = None) -> pd.DataFrame:
     """
-    Load kline from stock_data.db (SQLite, UTF-8).
+    Load kline from stock_data.db (DuckDB format).
 
     Columns in source: stock_code, date, open, high, low, close,
                        volume, amount, turnover_rate
     Returned columns:  code, date, open, high, low, close,
                        volume, amount, turn, pct_chg, preclose
     """
-    import sqlite3
-
-    con = sqlite3.connect(db_path)
+    # stock_data.db 是 SQLite 格式，用 sqlite3 读取后转 pandas
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(db_path)
     where_parts, params = [], []
     if start_date:
         where_parts.append("date >= ?")
@@ -294,12 +294,11 @@ def load_all_kline_sqlite(db_path: str,
 
 def load_stock_info_sqlite(db_path: str) -> dict:
     """
-    Load stock name + industry from stock_data.db (SQLite, UTF-8).
+    Load stock name + industry from stock_data.db (SQLite format).
     Returns {code: {"name": ..., "industry": ...}}.
     """
-    import sqlite3
-
-    con = sqlite3.connect(db_path)
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(db_path)
     rows = con.execute(
         "SELECT stock_code, stock_name, industry FROM stock_info"
     ).fetchall()
@@ -307,15 +306,35 @@ def load_stock_info_sqlite(db_path: str) -> dict:
 
     result = {}
     for code, name, industry in rows:
-        try:
-            if isinstance(name, bytes):
-                name = name.decode("utf-8", errors="replace")
-            if isinstance(industry, bytes):
-                industry = industry.decode("utf-8", errors="replace")
-        except Exception:
-            pass
         result[code] = {"name": name or "", "industry": industry or ""}
     return result
+
+
+def load_benchmark_kline(db_path: str,
+                         index_code: str = "000300",
+                         start_date: Optional[str] = None,
+                         end_date: Optional[str] = None) -> pd.DataFrame:
+    """
+    Load benchmark index kline from stock_data.db index_data table (SQLite format).
+    index_code: '000300' (沪深300), '000001' (上证指数), etc.
+    Returns DataFrame with columns: date, close
+    """
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(db_path)
+    where_parts = ["index_code = ?"]
+    params = [index_code]
+    if start_date:
+        where_parts.append("date >= ?")
+        params.append(start_date)
+    if end_date:
+        where_parts.append("date <= ?")
+        params.append(end_date)
+    where_sql = "WHERE " + " AND ".join(where_parts)
+    sql = f"SELECT date, close FROM index_data {where_sql} ORDER BY date"
+    df = pd.read_sql_query(sql, con, params=params)
+    con.close()
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return df
 
 
 def get_db_stats(db_path: str) -> dict:

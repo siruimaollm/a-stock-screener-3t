@@ -129,35 +129,36 @@ def cmd_ingest(cfg: dict, since: Optional[str] = None):
 #  BACKTEST
 # ─────────────────────────────────────────────
 def cmd_backtest(cfg: dict, auto_tune: bool = False):
-    import duckdb
     from src.backtest import run_backtest, check_pass_criteria
     from src.backtest_report import save_backtest_html
+    from src.data_fetcher import load_all_kline_sqlite, load_benchmark_kline
 
     print("\n=== STEP 3: Backtest ===")
-    db_path = cfg["data"]["db_path"]
+    stock_db = cfg["data"].get("stock_data_db", "data/stock_data.db")
     bt_cfg = cfg["backtest"]
     pass_criteria = bt_cfg["pass_criteria"]
     hold_periods = bt_cfg["hold_periods"]
 
-    # Load all kline
-    conn = duckdb.connect(db_path, read_only=True)
-    print("Loading main board kline ...")
-    all_kline = conn.execute(
-        "SELECT * FROM daily_kline WHERE date >= ? AND date <= ? ORDER BY code, date",
-        [bt_cfg["start_date"], bt_cfg["end_date"]]
-    ).df()
+    # 回测需要指标预热，多加载 220 天历史
+    from datetime import datetime as _dt, timedelta as _td
+    hist_start = (_dt.strptime(bt_cfg["start_date"], "%Y-%m-%d") - _td(days=220)).strftime("%Y-%m-%d")
 
-    bench_code = bt_cfg["benchmark"]
-    print(f"Loading benchmark {bench_code} ...")
-    try:
-        bench_kline = conn.execute(
-            "SELECT date, close FROM daily_kline WHERE code = ? ORDER BY date",
-            [bench_code]
-        ).df()
-    except Exception:
-        bench_kline = _fetch_benchmark(bench_code, bt_cfg["start_date"], bt_cfg["end_date"])
+    print(f"Loading main board kline ({hist_start} ~ {bt_cfg['end_date']}) ...")
+    all_kline = load_all_kline_sqlite(stock_db, table="daily_data_hfq",
+                                      start_date=hist_start,
+                                      end_date=bt_cfg["end_date"])
+    print(f"  {len(all_kline)} rows, {all_kline['code'].nunique()} stocks")
 
-    conn.close()
+    # 基准指数：从 index_data 表读取（代码去掉 sh./sz. 前缀）
+    bench_code_raw = bt_cfg["benchmark"]
+    bench_code = bench_code_raw.split(".")[-1]   # 'sh.000300' → '000300'
+    print(f"Loading benchmark {bench_code} from index_data ...")
+    bench_kline = load_benchmark_kline(stock_db, index_code=bench_code,
+                                       start_date=bt_cfg["start_date"],
+                                       end_date=bt_cfg["end_date"])
+    if bench_kline.empty:
+        print("  Benchmark not found in index_data, fetching via BaoStock ...")
+        bench_kline = _fetch_benchmark(bench_code_raw, bt_cfg["start_date"], bt_cfg["end_date"])
 
     vol_cfg = _build_vol_cfg(cfg)
     score_cfg = {"threshold": cfg["scoring"]["threshold"],
@@ -178,12 +179,9 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
         print("Starting auto-tune grid search ...")
         from src.tuner import grid_search
 
-        conn2 = duckdb.connect(db_path, read_only=True)
-        oos_kline = conn2.execute(
-            "SELECT * FROM daily_kline WHERE date >= ? AND date <= ? ORDER BY code, date",
-            [bt_cfg["out_of_sample_start"], bt_cfg["out_of_sample_end"]]
-        ).df()
-        conn2.close()
+        oos_kline = load_all_kline_sqlite(stock_db, table="daily_data_hfq",
+                                          start_date=bt_cfg["out_of_sample_start"],
+                                          end_date=bt_cfg["out_of_sample_end"])
 
         tune_result = grid_search(
             all_kline, bench_kline, pass_criteria,
