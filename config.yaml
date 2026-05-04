@@ -47,7 +47,7 @@ volatility:
 # 必要条件：BOLL≥1（触及下轨）+ 量价≥1 或 蜡烛≥2
 # 总分 ≥ 10 入选
 scoring:
-  threshold: 9                         # 总分 ≥ 9（满分15）
+  threshold: 7                         # 总分 ≥ 7（满分15，~47%）— 优化后阈值
   require_all_dimensions: true         # 保留兼容接口
   require_rsi_divergence: false        # RSI底背离为加分项，非硬性要求（得分已体现）
   rsi_long_oversold: 40                # RSI6 < 40 视为超卖
@@ -82,6 +82,17 @@ backtest:
     hold20_return_mean: 0.03           # 20日平均收益
     hold20_max_loss: -0.25             # 20日最大单笔亏损
     any_win_rate: 0.50                 # 任一持有期总胜率
+
+# ==================== 回测 v2（新出场规则）====================
+# 出场逻辑：
+#   止盈：+10% 或 收盘≥布林上轨 (先到先得)
+#   止损：破位 (close ≤ entry × (1 - break_down_pct))
+#   超时：持有满 max_hold 交易日
+backtest_v2:
+  take_profit:    0.10           # 固定止盈阈值
+  break_down_pct: 0.08           # 破位止损阈值（8%）
+  max_hold:       252            # 最长持有交易日（≈1年）
+  signal_freq:    "biweekly"     # 信号扫描频率：weekly / biweekly / monthly / daily
 
 # ==================== 妙想 API ====================
 miao:

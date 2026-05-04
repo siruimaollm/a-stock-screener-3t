@@ -1,5 +1,5 @@
 """
-Rolling 3-year backtest.
+Rolling backtest with optimized implementation.
 
 For each trading day T in [start_date, end_date]:
   1. Compute signals using data up to T
@@ -26,15 +26,6 @@ def _trading_dates(all_kline: pd.DataFrame) -> List[str]:
     return sorted(all_kline["date"].unique().tolist())
 
 
-def _get_price(all_kline: pd.DataFrame, code: str,
-               date: str, price_col: str) -> Optional[float]:
-    rows = all_kline[(all_kline["code"] == code) & (all_kline["date"] == date)]
-    if rows.empty:
-        return None
-    val = rows.iloc[0][price_col]
-    return float(val) if not pd.isna(val) else None
-
-
 def run_backtest(all_kline: pd.DataFrame,
                  benchmark_kline: pd.DataFrame,
                  start_date: str,
@@ -43,29 +34,30 @@ def run_backtest(all_kline: pd.DataFrame,
                  top_n: int = 20,
                  vol_cfg: Optional[dict] = None,
                  score_cfg: Optional[dict] = None,
-                 min_history: int = 120) -> Dict[str, Any]:
+                 ind_cfg: Optional[dict] = None,
+                 min_history: int = 60) -> Dict[str, Any]:
     """
     Returns dict with keys:
       trades_{h}: DataFrame of all trades for hold period h
       metrics_{h}: dict of summary metrics for hold period h
       pass: bool (whether ALL pass criteria are met)
-      diagnostics: text summary
     """
     if vol_cfg is None:
         vol_cfg = {}
     if score_cfg is None:
         score_cfg = {}
+    if ind_cfg is None:
+        ind_cfg = {}
 
-    amp30_min = vol_cfg.get("amp30_min", 0.15)
-    atr_pct_ratio = vol_cfg.get("atr_pct_ratio", 1.5)
-    bb_width_quantile = vol_cfg.get("bb_width_quantile", 0.80)
-    lookback = vol_cfg.get("lookback", 90)
     threshold = score_cfg.get("threshold", 7)
     require_all_dimensions = score_cfg.get("require_all_dimensions", True)
-    require_rsi_divergence = score_cfg.get("require_rsi_divergence", True)
-    rsi_long_oversold = score_cfg.get("rsi_long_oversold", 30)
+    require_rsi_divergence = score_cfg.get("require_rsi_divergence", False)
+    rsi_long_oversold = score_cfg.get("rsi_long_oversold", 40)
 
     trading_dates = _trading_dates(all_kline)
+    # Precompute date → index lookup (O(1) lookups)
+    date_to_tdx = {d: i for i, d in enumerate(trading_dates)}
+
     bench_map = {}
     if not benchmark_kline.empty:
         bench_map = dict(zip(benchmark_kline["date"], benchmark_kline["close"].astype(float)))
@@ -73,41 +65,67 @@ def run_backtest(all_kline: pd.DataFrame,
     # Filter to backtest window
     bt_dates = [d for d in trading_dates if start_date <= d <= end_date]
 
-    # Pre-group kline by code
+    # Pre-group kline by code, sort by date
+    print("Pre-grouping kline data...")
     codes = all_kline["code"].unique().tolist()
-    by_code = {c: all_kline[all_kline["code"] == c].sort_values("date").reset_index(drop=True)
-               for c in codes}
+    by_code = {}
+    for c in codes:
+        sub = all_kline[all_kline["code"] == c].sort_values("date").reset_index(drop=True)
+        if len(sub) >= 30:
+            by_code[c] = sub
 
-    # Precompute all indicators (expensive but done once)
-    print("Computing indicators for all stocks...")
-    indicator_cache: dict[str, pd.DataFrame] = {}
+    # Precompute all indicators (done once per stock)
+    print(f"Computing indicators for {len(by_code)} stocks...")
+    indicator_cache: dict = {}
     for code, df in by_code.items():
-        if len(df) >= 30:
-            indicator_cache[code] = add_all_indicators(df)
+        try:
+            indicator_cache[code] = add_all_indicators(df, **ind_cfg)
+        except Exception:
+            pass
+
+    # Precompute per-stock: array of dates and fast open/close price lookups
+    print("Building price lookup tables...")
+    price_open: dict = {}   # code → {date: open_price}
+    price_close: dict = {}  # code → {date: close_price}
+    stock_dates: dict = {}  # code → sorted list of dates as strings
+    stock_date_arr: dict = {}  # code → np.array of dates for searchsorted
+
+    for code, df in by_code.items():
+        dates_list = df["date"].tolist()
+        stock_dates[code] = dates_list
+        stock_date_arr[code] = np.array(dates_list)
+        price_open[code] = dict(zip(df["date"], df["open"].astype(float)))
+        price_close[code] = dict(zip(df["date"], df["close"].astype(float)))
 
     # collect trades per hold period
     trades: Dict[int, list] = {h: [] for h in hold_periods}
 
-    print(f"Running backtest over {len(bt_dates)} trading days...")
+    print(f"Running backtest over {len(bt_dates)} trading days ({start_date} ~ {end_date})...")
     for i, t_date in enumerate(bt_dates):
-        if i % 20 == 0:
-            print(f"  {t_date} ({i}/{len(bt_dates)})")
+        if i % 50 == 0:
+            print(f"  {t_date} ({i}/{len(bt_dates)})  trades so far: {sum(len(v) for v in trades.values())}")
 
-        # find T+1 (buy date)
-        t_idx = trading_dates.index(t_date)
+        t_idx = date_to_tdx[t_date]
         if t_idx + max(hold_periods) + 1 >= len(trading_dates):
             continue
         buy_date = trading_dates[t_idx + 1]
 
-        # score stocks with data up to t_date
+        # Score each stock using data up to t_date (inclusive)
         candidates = []
         for code, df_full in indicator_cache.items():
-            df_t = df_full[df_full["date"] <= t_date]
-            if len(df_t) < min_history:
+            # Fast: find row count up to t_date using searchsorted
+            date_arr = stock_date_arr[code]
+            # searchsorted returns insertion point; all indices < that are <= t_date
+            idx = int(np.searchsorted(date_arr, t_date, side="right"))
+            if idx < min_history:
                 continue
-            if not passes_volatility(df_t, amp30_min, atr_pct_ratio, bb_width_quantile, lookback):
+            df_t = df_full.iloc[:idx]
+            try:
+                if not passes_volatility(df_t, **vol_cfg):
+                    continue
+                s = score_stock(df_t, rsi_long_oversold=rsi_long_oversold)
+            except Exception:
                 continue
-            s = score_stock(df_t, rsi_long_oversold=rsi_long_oversold)
             s["code"] = code
             if is_selected(s, threshold, require_all_dimensions, require_rsi_divergence):
                 candidates.append(s)
@@ -117,10 +135,10 @@ def run_backtest(all_kline: pd.DataFrame,
 
         for p in top:
             code = p["code"]
-            buy_price = _get_price(all_kline, code, buy_date, "open")
-            if buy_price is None or buy_price <= 0:
-                buy_price = _get_price(all_kline, code, buy_date, "close")
-            if buy_price is None or buy_price <= 0:
+            buy_price = price_open[code].get(buy_date)
+            if buy_price is None or np.isnan(buy_price) or buy_price <= 0:
+                buy_price = price_close[code].get(buy_date)
+            if buy_price is None or np.isnan(buy_price) or buy_price <= 0:
                 continue
 
             bench_buy = bench_map.get(buy_date)
@@ -130,15 +148,18 @@ def run_backtest(all_kline: pd.DataFrame,
                 if sell_date_idx >= len(trading_dates):
                     continue
                 sell_date = trading_dates[sell_date_idx]
-                sell_price = _get_price(all_kline, code, sell_date, "close")
-                if sell_price is None or sell_price <= 0:
+                sell_price = price_close[code].get(sell_date)
+                if sell_price is None or np.isnan(sell_price) or sell_price <= 0:
                     continue
 
                 ret = (sell_price - buy_price) / buy_price
                 bench_sell = bench_map.get(sell_date)
-                bench_ret = ((bench_sell - bench_buy) / bench_buy
-                             if bench_buy and bench_sell and bench_buy > 0 else np.nan)
-                excess = ret - bench_ret if not np.isnan(bench_ret) else np.nan
+                if bench_buy and bench_sell and bench_buy > 0:
+                    bench_ret = (bench_sell - bench_buy) / bench_buy
+                    excess = ret - bench_ret
+                else:
+                    bench_ret = np.nan
+                    excess = np.nan
 
                 trades[h].append({
                     "signal_date": t_date,
@@ -196,7 +217,6 @@ def run_backtest(all_kline: pd.DataFrame,
 def check_pass_criteria(results: dict, criteria: dict) -> Tuple[bool, List[str]]:
     """
     Returns (passed: bool, failed_messages: list[str]).
-    criteria keys from config.yaml backtest.pass_criteria.
     """
     m10 = results.get("metrics_10", {})
     m20 = results.get("metrics_20", {})
