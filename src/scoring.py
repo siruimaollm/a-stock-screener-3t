@@ -1,283 +1,435 @@
 """
-Layer 2 — 三指标共振评分体系 (满分 0-9 分)
-按 "A股大幅波动股票筛选策略 BOLL × RSI × KDJ" 文档实现，并在以下两点上更严格:
-  - threshold = 7 (仅入选强信号)
-  - RSI 看涨底背离 = 必要条件 (不只是加分项)
+Layer 2 — 五维共振评分体系（重构版，满分 15 分）
 
-每个指标贡献 0-3 分。三指标方向须一致（同为买入或同为卖出）方可叠加。
-本实现仅做买入方向（超卖反转）。
+策略定位：筛出「曾剧烈波动、近期BB带宽收窄整理、触及下轨后反转」的超卖反弹候选。
 
 ============================================================
-BOLL 评分 (0-3 分) — 基于 %B 和带宽信号
-  3 分: %B < 0.05  且 带宽扩张 且 价格向上突破中轨
-  2 分: %B < 0.1  且 反弹K线(收 > 开)
-  1 分: 仅带宽扩张 且 %B 在 [0.1, 0.3] 之间
-  0 分: %B 处于 [0.3, 0.7] 区间内横向震荡
+维度1 BOLL（0-3分）— 必要条件维度
+  核心要求：近3日触及布林下轨 + 带宽收窄
+  3分: 近3日触及下轨 + 带宽收窄 + %B今日回升（开始反弹）
+  2分: 近3日触及下轨 + 带宽收窄
+  1分: 近3日触及下轨（带宽未明显收窄）
+  0分: 未触及下轨 → 此维度为 0 时整只股票强制淘汰
 
 ============================================================
-RSI 评分 (0-3 分) — 双周期联动 RSI6(短) + RSI12(中)
-  3 分: RSI6 < 30 且 RSI12 < 30 且 出现看涨底背离 [必要条件]
-  2 分: RSI6 < 30 且 RSI12 < 30 (双周期同时超卖，无背离)
-  1 分: RSI6 < 30，RSI12 在 [30, 50] (仅短周期超卖)
-  0 分: RSI6 >= 30 或 RSI12 > 50 (分歧无效)
+维度2 RSI（0-3分）
+  RSI(6) < 40 为基本要求，底背离为加分项
+  3分: RSI6 < 40 + 底背离 + RSI6今日>昨日（开始回升）
+  2分: RSI6 < 40 + 底背离
+  1分: RSI6 < 40（无底背离）
+  0分: RSI6 ≥ 40
 
-  看涨底背离严格定义:
-    1) 当前价格创近 20 日新低
-    2) 当前 RSI6 高于近20日内最低 RSI6 (RSI 形成更高的低点)
-    3) 形成时 RSI6 < 40
-    4) 配合 BOLL %B < 0.15 效果最佳
+  底背离定义：价格创20日新低 + RSI6未创新低 + RSI6 < 40
 
 ============================================================
-KDJ 评分 (0-3 分) — J 线极值为最高权重的领先信号
-  3 分: J < 0  (理论超卖极限突破)
-  2 分: J < 20 且 K 在近 3 根K线内上穿 D (低位金叉)
-  1 分: K < 30 且 K 向上运动
-  0 分: KDJ 各线在 [30, 70] 区间内震荡
+维度3 KDJ（0-3分）
+  核心要求：K上穿D（金叉）+ J带头向上
+  3分: K上穿D + J向上 + K<30（低位金叉）
+  2分: K上穿D + J向上
+  1分: K上穿D（J未必向上）或 J向上且K<30
+  0分: 无金叉且无J向上低位信号
 
 ============================================================
-入选标准:
-  total_score >= threshold (默认 7，仅强信号)
-  三个维度都 >= 1 分 (共振)
-  has_divergence == True   (RSI看涨底背离作为必要条件)
+维度4 量价（0-3分）— 多路径明显止跌确认
+  3分路径A: 连续3日量比递减+均值<0.75 + 收盘≥当日(H+L)/2 + 5日未创收盘新低
+  3分路径B: 前3日缩量（均值<0.7）后今日放量阳线（承接确认）
+  2分: 今日量比<0.65 + 收盘≥当日(H+L)/2（单日明显缩量且收盘强势）
+  1分: 5日均量比<0.85 + 收盘≥昨收×0.995（温和缩量价稳）
+  0分: 放量阴线 或 不满足以上任何路径
+
+============================================================
+维度5 蜡烛形态（0-3分）
+  核心要求：金针探底（长下影+小实体+收盘高位）
+  3分: 创近10日新低 + 下影线≥实体×3 + 收盘位于K线≥70% + 实体≤30%
+  2分: 下影线≥实体×2 + 收盘位于K线≥65% + 实体≤40%
+  1分: 收盘位于K线≥60% + 收阳线
+  0分: 大阴线/长上影/无下影
+
+============================================================
+入选标准（总分满分15）：
+  ① BOLL维度 ≥ 1（必须触及下轨，不满足直接淘汰）
+  ② 量价止跌确认（三档任一）：
+       vol≥2  OR  candle≥3  OR  (vol≥1 AND candle≥2)
+  ③ total_score ≥ 9
+  排序：total_score DESC，candle_score DESC，rsi底背离优先
 """
 import numpy as np
 import pandas as pd
 
 
-def _cross_above(series_a: pd.Series, series_b: pd.Series, lookback: int = 3) -> bool:
-    """series_a 在最近 lookback 根 K 线内上穿 series_b。"""
-    if len(series_a) < lookback + 1:
-        return False
-    for i in range(-lookback, 0):
-        prev_i = i - 1
-        if (series_a.iloc[prev_i] <= series_b.iloc[prev_i] and
-                series_a.iloc[i] > series_b.iloc[i]):
-            return True
-    return False
-
-
-def _bw_expanding(df: pd.DataFrame, lookback: int = 5) -> bool:
-    """当前带宽 > lookback 日前带宽 → 带宽由近期低点开始上翻。"""
-    if "bb_width" not in df.columns or len(df) < lookback + 1:
-        return False
-    bw_now = df["bb_width"].iloc[-1]
-    bw_past = df["bb_width"].iloc[-1 - lookback]
-    if pd.isna(bw_now) or pd.isna(bw_past) or bw_past <= 0:
-        return False
-    return bw_now > bw_past
-
+# ─────────────────────────────────────────────
+#  辅助函数
+# ─────────────────────────────────────────────
 
 def detect_bullish_divergence(close: pd.Series, rsi: pd.Series,
-                                lookback: int = 20) -> bool:
+                               lookback: int = 20) -> bool:
     """
-    严格定义看涨底背离:
-      1) 当前价格创近 lookback 日新低 (今日 close < 过去 lookback 日内除今日外的最低 close)
-      2) 当前 RSI > 过去 lookback 日内最低 RSI (RSI 形成更高的低点)
-      3) 形成时 RSI < 40 (PDF: 有效区间)
+    看涨底背离：
+      1) 当前价格创近 lookback 日新低
+      2) 当前 RSI6 高于窗口内最低 RSI6（RSI未创新低）
+      3) 当前 RSI6 < 40
     """
     if len(close) < lookback + 1 or len(rsi) < lookback + 1:
         return False
-
-    curr_close = close.iloc[-1]
-    curr_rsi = rsi.iloc[-1]
-    if pd.isna(curr_close) or pd.isna(curr_rsi):
+    curr_close = float(close.iloc[-1])
+    curr_rsi = float(rsi.iloc[-1])
+    if pd.isna(curr_close) or pd.isna(curr_rsi) or curr_rsi >= 40:
         return False
-
-    # 过去 lookback 日内除今日外的窗口
     past_close = close.iloc[-(lookback + 1):-1]
     past_rsi = rsi.iloc[-(lookback + 1):-1]
-    if past_close.empty or past_rsi.empty:
+    if past_close.empty or past_rsi.dropna().empty:
         return False
-
-    past_close_min = past_close.min()
-    past_rsi_min = past_rsi.min()
-    if pd.isna(past_close_min) or pd.isna(past_rsi_min):
+    if curr_close >= float(past_close.min()):
         return False
-
-    # 1) 今日价格创新低
-    if curr_close >= past_close_min:
+    if curr_rsi <= float(past_rsi.min()):
         return False
-
-    # 2) 今日 RSI 高于过去窗口最低 RSI (RSI 未创新低 = 背离)
-    if curr_rsi <= past_rsi_min:
-        return False
-
-    # 3) 当前 RSI < 40 才有效
-    if curr_rsi >= 40:
-        return False
-
     return True
 
 
+def _bw_narrowing(df: pd.DataFrame) -> bool:
+    """当前BB带宽 < 近20日峰值×0.75（带宽收窄中）。"""
+    if "bb_width" not in df.columns or len(df) < 20:
+        return False
+    bw = df["bb_width"].dropna()
+    if len(bw) < 10:
+        return False
+    bw_now = float(bw.iloc[-1])
+    bw_max20 = float(bw.iloc[-20:].max())
+    return bw_max20 > 0 and bw_now < bw_max20 * 0.75
+
+
+# ─────────────────────────────────────────────
+#  五个评分函数
+# ─────────────────────────────────────────────
+
 def score_boll(df: pd.DataFrame) -> tuple:
-    """Returns (score 0-3, list of triggered signals)."""
-    if len(df) < 6:
+    """
+    BOLL评分（0-3分）。
+    必要条件：近3日有 low ≤ bb_lower。
+    3分: 带宽收窄 + 连续2日%B回升 + %B<0.3（明确从下轨反弹）
+    2分: 带宽收窄 + 单日%B回升
+    1分: 触及下轨（带宽未明显收窄）
+    """
+    if len(df) < 10 or "bb_lower" not in df.columns:
         return 0, []
 
-    last = df.iloc[-1]
-    close = float(last["close"]) if not pd.isna(last.get("close", np.nan)) else None
-    open_p = float(last["open"]) if "open" in df.columns and not pd.isna(last.get("open", np.nan)) else None
-    bb_mid = float(last["bb_mid"]) if not pd.isna(last.get("bb_mid", np.nan)) else None
-    pct_b = last.get("pct_b", np.nan)
-
-    if close is None or pd.isna(pct_b):
+    # 近3日是否触及下轨
+    recent3 = df.iloc[-3:]
+    touched = bool((recent3["low"].astype(float) <= recent3["bb_lower"].astype(float)).any())
+    if not touched:
         return 0, []
 
-    bw_expanding = _bw_expanding(df, lookback=5)
+    narrowing = _bw_narrowing(df)
 
-    # 价格上穿中轨：今日 close > bb_mid 且 昨日 close <= 昨日 bb_mid
-    crossed_mid = False
-    if bb_mid is not None and close > bb_mid and len(df) >= 2:
-        prev = df.iloc[-2]
-        prev_close = float(prev["close"]) if not pd.isna(prev["close"]) else None
-        prev_mid = float(prev["bb_mid"]) if not pd.isna(prev["bb_mid"]) else None
-        if prev_close is not None and prev_mid is not None and prev_close <= prev_mid:
-            crossed_mid = True
+    pct_b = float(df["pct_b"].iloc[-1]) if "pct_b" in df.columns else np.nan
 
-    bullish_candle = open_p is not None and close > open_p
+    # %B连续2日回升（更严格确认）
+    pct_b_rebounding_2d = False
+    pct_b_rebounding_1d = False
+    if "pct_b" in df.columns and len(df) >= 3:
+        pb_now   = df["pct_b"].iloc[-1]
+        pb_prev  = df["pct_b"].iloc[-2]
+        pb_prev2 = df["pct_b"].iloc[-3]
+        if not any(pd.isna(x) for x in [pb_now, pb_prev, pb_prev2]):
+            pb_now, pb_prev, pb_prev2 = float(pb_now), float(pb_prev), float(pb_prev2)
+            pct_b_rebounding_2d = (pb_now > pb_prev > pb_prev2) and pb_now < 0.3
+            pct_b_rebounding_1d = pb_now > pb_prev
+    elif "pct_b" in df.columns and len(df) >= 2:
+        pb_now  = df["pct_b"].iloc[-1]
+        pb_prev = df["pct_b"].iloc[-2]
+        if not any(pd.isna(x) for x in [pb_now, pb_prev]):
+            pct_b_rebounding_1d = float(pb_now) > float(pb_prev)
 
-    if pct_b < 0.05 and bw_expanding and crossed_mid:
-        return 3, ["%B<0.05+带宽扩张+突破中轨"]
-    if pct_b < 0.1 and bullish_candle:
-        return 2, ["下轨阳线反弹(%B<0.1)"]
-    if 0.1 <= pct_b < 0.3 and bw_expanding:
-        return 1, ["带宽扩张+下沿区域"]
-    return 0, []
+    if narrowing and pct_b_rebounding_2d:
+        return 3, [f"布林下轨触及+带宽收窄+连续%B回升({pct_b:.2f})"]
+    if narrowing and pct_b_rebounding_1d:
+        return 2, [f"布林下轨触及+带宽收窄+%B回升({pct_b:.2f})"]
+    if narrowing:
+        return 2, [f"布林下轨触及+带宽收窄({pct_b:.2f})"]
+    return 1, [f"布林下轨触及(%B={pct_b:.2f})"]
 
 
-def score_rsi(df: pd.DataFrame, rsi_long_oversold: float = 30) -> tuple:
+def score_rsi(df: pd.DataFrame, rsi_oversold: float = 40) -> tuple:
     """
-    Returns (score 0-3, list of signals, has_divergence flag).
-    使用 RSI6 (短周期) + RSI12 (中周期) 双周期联动。
-    rsi_long_oversold: RSI12 视为"超卖"的阈值。PDF原文=30，波动剧烈时可放宽到35。
+    RSI评分（0-3分）。
+    RSI6 < rsi_oversold 为基本要求。
+    3分: 底背离 + 连续2日RSI6回升（确认反转）
+    2分: 底背离 + 单日回升，或底背离本身
+    1分: RSI6<超卖线（无背离）
     """
-    if "rsi6" not in df.columns or "rsi12" not in df.columns:
+    if "rsi6" not in df.columns or len(df) < 3:
         return 0, [], False
 
-    last = df.iloc[-1]
-    rsi6 = last.get("rsi6", np.nan)
-    rsi12 = last.get("rsi12", np.nan)
-    if pd.isna(rsi6) or pd.isna(rsi12):
+    rsi6_now   = float(df["rsi6"].iloc[-1])
+    rsi6_prev  = float(df["rsi6"].iloc[-2])
+    rsi6_prev2 = float(df["rsi6"].iloc[-3])
+    if pd.isna(rsi6_now):
         return 0, [], False
 
-    rsi6 = float(rsi6)
-    rsi12 = float(rsi12)
+    has_div = detect_bullish_divergence(df["close"].astype(float), df["rsi6"].astype(float))
 
-    has_divergence = detect_bullish_divergence(
-        df["close"].astype(float), df["rsi6"], lookback=20
-    )
+    # 连续2日回升 vs 单日回升
+    rising_2d = rsi6_now > rsi6_prev and rsi6_prev > rsi6_prev2
+    rising_1d = rsi6_now > rsi6_prev
 
-    if rsi6 >= 30:
-        return 0, [], has_divergence
-    if rsi12 > 50:
-        return 0, [], has_divergence
+    if rsi6_now >= rsi_oversold:
+        return 0, [], has_div
 
-    if rsi12 < rsi_long_oversold:
-        if has_divergence:
-            return 3, [f"RSI6&12双周期超卖+底背离(R12<{rsi_long_oversold})"], True
-        return 2, [f"RSI6&12双周期超卖(R12<{rsi_long_oversold})"], False
-
-    return 1, [f"仅RSI6超卖(RSI12={rsi12:.1f})"], has_divergence
+    if has_div and rising_2d:
+        return 3, [f"RSI6底背离+连续回升(RSI6={rsi6_now:.1f})"], True
+    if has_div and rising_1d:
+        return 2, [f"RSI6底背离+回升(RSI6={rsi6_now:.1f})"], True
+    if has_div:
+        return 2, [f"RSI6底背离(RSI6={rsi6_now:.1f})"], True
+    if rising_1d:
+        return 1, [f"RSI6<{rsi_oversold:.0f}+回升(RSI6={rsi6_now:.1f})"], False
+    return 1, [f"RSI6<{rsi_oversold:.0f}(RSI6={rsi6_now:.1f})"], False
 
 
 def score_kdj(df: pd.DataFrame) -> tuple:
-    """Returns (score 0-3, list of signals)."""
-    if "J" not in df.columns or "K" not in df.columns or "D" not in df.columns:
+    """
+    KDJ评分（0-3分）。
+    核心信号：K上穿D（金叉）+ J带头向上。
+    """
+    if not all(c in df.columns for c in ["K", "D", "J"]) or len(df) < 2:
         return 0, []
 
-    last = df.iloc[-1]
-    j_val = last.get("J", np.nan)
-    k_val = last.get("K", np.nan)
-    if pd.isna(j_val) or pd.isna(k_val):
+    k_now  = float(df["K"].iloc[-1]);  k_prev = float(df["K"].iloc[-2])
+    d_now  = float(df["D"].iloc[-1]);  d_prev = float(df["D"].iloc[-2])
+    j_now  = float(df["J"].iloc[-1]);  j_prev = float(df["J"].iloc[-2])
+    if any(pd.isna(x) for x in [k_now, d_now, j_now, k_prev, d_prev, j_prev]):
         return 0, []
 
-    j_val = float(j_val)
-    k_val = float(k_val)
+    golden_cross = k_prev <= d_prev and k_now > d_now   # K上穿D
+    j_rising = j_now > j_prev                             # J向上
+    low_pos = k_now < 30 and d_now < 30                  # 低位
 
-    if j_val < 0:
-        return 3, ["J<0极度超卖"]
-    if j_val < 20 and _cross_above(df["K"], df["D"], lookback=3):
-        return 2, ["J<20低位金叉(K穿D)"]
-    if k_val < 30 and len(df) >= 2:
-        k_prev = df["K"].iloc[-2]
-        if not pd.isna(k_prev) and k_val > k_prev:
-            return 1, ["K<30低位上行"]
+    if golden_cross and j_rising and low_pos:
+        return 3, [f"KDJ低位金叉+J向上(K={k_now:.0f},D={d_now:.0f},J={j_now:.0f})"]
+    if golden_cross and j_rising:
+        return 2, [f"KDJ金叉+J向上(K={k_now:.0f},D={d_now:.0f},J={j_now:.0f})"]
+    if golden_cross:
+        return 1, [f"KDJ金叉(K={k_now:.0f},D={d_now:.0f})"]
+    if j_rising and k_now < 30:
+        return 1, [f"J向上低位(K={k_now:.0f},J={j_now:.0f})"]
     return 0, []
 
 
-def score_stock(df: pd.DataFrame, rsi_long_oversold: float = 30) -> dict:
-    """对单只股票打分。"""
+def score_volume(df: pd.DataFrame) -> tuple:
+    """
+    量价评分（0-3分）。
+    核心信号：量价出现明显止跌特征，多路径判定：
+
+    Path A（3分）: 连续3日量比严格递减 + 3日均值<0.75 + 收盘≥当日中轴(H+L)/2 + 5日未创收盘新低
+    Path B（3分）: 前3日量比均值<0.7后今日放量阳线（缩量整理后承接确认）
+    Path C（2分）: 今日量比<0.65 + 收盘≥当日中轴（单日明显缩量+收盘强势）
+    Path D（1分）: 5日均量比<0.85 + 收盘≥昨收×0.995（温和缩量价稳）
+    """
+    if "vol_ratio" not in df.columns or len(df) < 6:
+        return 0, []
+
+    last = df.iloc[-1]
+    vr_now = last.get("vol_ratio", np.nan)
+    if pd.isna(vr_now):
+        return 0, []
+    vr_now = float(vr_now)
+
+    close_now  = float(last["close"]) if not pd.isna(last.get("close")) else None
+    close_prev = float(df["close"].iloc[-2]) if len(df) >= 2 else None
+    high_now   = float(last["high"])  if not pd.isna(last.get("high"))  else None
+    low_now    = float(last["low"])   if not pd.isna(last.get("low"))   else None
+    if close_now is None or close_prev is None or high_now is None or low_now is None:
+        return 0, []
+
+    # 价格止跌的严格定义：收盘在当日(H+L)/2以上（不只是未大跌）
+    mid_price       = (high_now + low_now) / 2
+    close_above_mid = close_now >= mid_price
+
+    # 5日内未创收盘新低（排除持续阴跌中的假缩量）
+    past5_close_min = float(df["close"].iloc[-6:-1].min()) if len(df) >= 6 else close_now
+    price_no_new_low = close_now >= past5_close_min
+
+    # 放量阴线直接归零（出货信号）
+    if vr_now >= 1.5 and close_now < close_prev:
+        return 0, []
+
+    # ── Path A：连续3日量比递减 + 持续缩量止跌 ──
+    vr_series = df["vol_ratio"].iloc[-3:].tolist()
+    vr_declining = (len(vr_series) == 3
+                    and not any(pd.isna(v) for v in vr_series)
+                    and vr_series[0] > vr_series[1] > vr_series[2])
+    vr_3d_mean = float(df["vol_ratio"].iloc[-3:].mean())
+
+    if vr_declining and vr_3d_mean < 0.75 and close_above_mid and price_no_new_low:
+        return 3, [f"持续缩量止跌(3日量比递减{vr_series[0]:.2f}→{vr_series[2]:.2f},均={vr_3d_mean:.2f},收≥中轴)"]
+
+    # ── Path B：缩量整理后放量阳线确认 ──
+    vr_prev3_mean = float(df["vol_ratio"].iloc[-4:-1].mean()) if len(df) >= 4 else np.nan
+    if (not pd.isna(vr_prev3_mean)
+            and vr_prev3_mean < 0.7
+            and vr_now >= 1.1
+            and close_now > close_prev):
+        return 3, [f"缩量整理后放量阳线(前3日均={vr_prev3_mean:.2f}→今={vr_now:.2f}↑,收阳)"]
+
+    # ── Path C：单日明显缩量+收盘强势 ──
+    if vr_now < 0.65 and close_above_mid:
+        return 2, [f"单日明显缩量止跌(量比={vr_now:.2f},收{close_now:.2f}≥中轴{mid_price:.2f})"]
+
+    # ── Path D：温和缩量价稳 ──
+    vr_5d_mean = float(df["vol_ratio"].iloc[-5:].mean())
+    if vr_5d_mean < 0.85 and close_now >= close_prev * 0.995:
+        return 1, [f"量缩价稳(5日均量比={vr_5d_mean:.2f})"]
+
+    return 0, []
+
+
+def score_candle(df: pd.DataFrame) -> tuple:
+    """
+    蜡烛形态评分（0-3分）。
+    核心信号：金针探底（长下影+小实体+收盘高位，在低位创新低后强势收回）。
+    """
+    if len(df) < 11:
+        return 0, []
+
+    last = df.iloc[-1]
+    o = last.get("open"); h = last.get("high")
+    l = last.get("low");  c = last.get("close")
+    if any(pd.isna(x) for x in [o, h, l, c]):
+        return 0, []
+    o, h, l, c = float(o), float(h), float(l), float(c)
+
+    rng = h - l
+    if rng <= 0:
+        return 0, []
+
+    body = abs(c - o)
+    lower_shadow = min(o, c) - l
+    close_pos = (c - l) / rng          # 收盘在K线中的相对位置（0=最低，1=最高）
+    body_ratio = body / rng             # 实体占K线比例
+
+    prev10_low = float(df["low"].iloc[-11:-1].min())
+    is_new_low10 = l < prev10_low
+
+    # 3分：金针探底（最高信号）
+    if (is_new_low10
+            and lower_shadow >= body * 3
+            and close_pos >= 0.70
+            and body_ratio <= 0.30):
+        ratio = lower_shadow / (body + 1e-9)
+        return 3, [f"金针探底(创10日新低+下影/实体={ratio:.1f}+收盘{close_pos:.0%})"]
+
+    # 2分：普通锤子线
+    if (lower_shadow >= body * 2
+            and close_pos >= 0.65
+            and body_ratio <= 0.40):
+        ratio = lower_shadow / (body + 1e-9)
+        return 2, [f"锤子线(下影/实体={ratio:.1f}+收盘{close_pos:.0%})"]
+
+    # 1分：收盘强势阳线
+    if close_pos >= 0.60 and c >= o:
+        return 1, [f"收盘强势阳线({close_pos:.0%})"]
+
+    return 0, []
+
+
+# ─────────────────────────────────────────────
+#  汇总评分
+# ─────────────────────────────────────────────
+
+def score_stock(df: pd.DataFrame, rsi_long_oversold: float = 40) -> dict:
+    """对单只股票打分（5维：BOLL+RSI+KDJ+量价+蜡烛，满分15）。"""
     result = {
-        "boll_score": 0,
-        "rsi_score": 0,
-        "kdj_score": 0,
-        "total_score": 0,
-        "has_divergence": False,
-        "signals": [],
+        "boll_score": 0, "rsi_score": 0, "kdj_score": 0,
+        "vol_score": 0, "candle_score": 0, "total_score": 0,
+        "has_divergence": False, "signals": [],
         "rsi6": np.nan, "rsi12": np.nan, "rsi24": np.nan,
         "K": np.nan, "D": np.nan, "J": np.nan,
         "bb_upper": np.nan, "bb_mid": np.nan, "bb_lower": np.nan,
         "bb_width": np.nan, "pct_b": np.nan,
         "atr_pct": np.nan, "amp30": np.nan,
         "close": np.nan, "open": np.nan, "volume": np.nan,
+        "vol_ratio": np.nan, "amount_ma5": np.nan,
     }
 
     if df is None or len(df) < 30:
         return result
 
     last = df.iloc[-1]
-    for col in ["rsi6", "rsi12", "rsi24",
-                "K", "D", "J",
+    for col in ["rsi6", "rsi12", "rsi24", "K", "D", "J",
                 "bb_upper", "bb_mid", "bb_lower", "bb_width", "pct_b",
-                "atr_pct", "amp30", "close", "open", "volume"]:
+                "atr_pct", "amp30", "close", "open", "volume",
+                "vol_ratio", "amount_ma5"]:
         if col in df.columns:
             result[col] = last[col]
 
-    boll, sig_b = score_boll(df)
-    rsi, sig_r, has_div = score_rsi(df, rsi_long_oversold=rsi_long_oversold)
-    kdj, sig_k = score_kdj(df)
+    boll,   sig_b         = score_boll(df)
+    rsi,    sig_r, has_div = score_rsi(df, rsi_oversold=rsi_long_oversold)
+    kdj,    sig_k         = score_kdj(df)
+    vol,    sig_v         = score_volume(df)
+    candle, sig_c         = score_candle(df)
 
-    result["boll_score"] = boll
-    result["rsi_score"] = rsi
-    result["kdj_score"] = kdj
-    result["total_score"] = boll + rsi + kdj
+    result["boll_score"]   = boll
+    result["rsi_score"]    = rsi
+    result["kdj_score"]    = kdj
+    result["vol_score"]    = vol
+    result["candle_score"] = candle
+    result["total_score"]  = boll + rsi + kdj + vol + candle
     result["has_divergence"] = has_div
-    result["signals"] = sig_b + sig_r + sig_k
+    result["signals"] = sig_b + sig_r + sig_k + sig_v + sig_c
     return result
 
 
-def is_selected(scores: dict, threshold: int = 7,
+def is_selected(scores: dict, threshold: int = 9,
                 require_all_dimensions: bool = True,
-                require_rsi_divergence: bool = True) -> bool:
+                require_rsi_divergence: bool = False) -> bool:
     """
-    入选标准：
-      total_score >= threshold (默认 7，仅强信号)
-      三维度都 >= 1 分 (共振)
-      has_divergence == True (RSI看涨底背离必要条件)
+    入选标准（5维满分15）：
+      ① boll_score ≥ 1（必须触及下轨，硬性必要条件）
+      ② 量价止跌确认（三档任一达标）：
+           vol_score ≥ 2  ← 明显止跌（持续缩量/缩量后放量阳线）
+         OR candle_score ≥ 3  ← 极强金针探底
+         OR (vol_score ≥ 1 AND candle_score ≥ 2)  ← 温和缩量+锤子线组合
+      ③ total_score ≥ threshold（默认9）
+      require_rsi_divergence=True 时额外要求底背离（默认不强制）
     """
+    # ① BOLL硬性条件
+    if scores.get("boll_score", 0) < 1:
+        return False
+
+    # ② 量价止跌确认（三档达标）
+    vol    = scores.get("vol_score", 0)
+    candle = scores.get("candle_score", 0)
+    vol_candle_ok = (vol >= 2) or (candle >= 3) or (vol >= 1 and candle >= 2)
+    if not vol_candle_ok:
+        return False
+
+    # ③ 总分门槛
     if scores["total_score"] < threshold:
         return False
-    if require_all_dimensions:
-        if scores["boll_score"] < 1:
-            return False
-        if scores["rsi_score"] < 1:
-            return False
-        if scores["kdj_score"] < 1:
-            return False
+
+    # 可选：底背离
     if require_rsi_divergence and not scores.get("has_divergence", False):
         return False
+
     return True
 
 
-def score_all(stock_data: dict, threshold: int = 7,
+def score_all(stock_data: dict, threshold: int = 10,
               require_all_dimensions: bool = True,
-              require_rsi_divergence: bool = True,
-              rsi_long_oversold: float = 30, **kwargs) -> list:
+              require_rsi_divergence: bool = False,
+              rsi_long_oversold: float = 40, **kwargs) -> list:
     selected = []
     for code, df in stock_data.items():
         s = score_stock(df, rsi_long_oversold=rsi_long_oversold)
         s["code"] = code
         if is_selected(s, threshold, require_all_dimensions, require_rsi_divergence):
             selected.append(s)
-    selected.sort(key=lambda x: x["total_score"], reverse=True)
+
+    # 排序：总分 > 底背离 > 蜡烛形态 > KDJ
+    selected.sort(key=lambda x: (
+        x["total_score"],
+        1 if x.get("has_divergence") else 0,
+        x.get("candle_score", 0),
+        x.get("kdj_score", 0),
+    ), reverse=True)
     return selected

@@ -1,0 +1,67 @@
+backtest:
+  benchmark: sh.000300
+  end_date: '2026-04-25'
+  hold_periods:
+  - 5
+  - 10
+  - 20
+  out_of_sample_end: '2025-06-30'
+  out_of_sample_start: '2025-04-01'
+  pass_criteria:
+    any_win_rate: 0.5
+    hold10_excess_return_mean: 0.015
+    hold10_excess_win_rate: 0.55
+    hold20_max_loss: -0.25
+    hold20_return_mean: 0.03
+  start_date: '2025-07-01'
+  top_n: 20
+data:
+  baostock_workers: 4
+  db_path: data/kline.duckdb
+  ingest_since: '2025-04-01'
+  retry: 3
+indicators:
+  atr_period: 14
+  boll_period: 14
+  boll_std: 2
+  kdj_period: 9
+  kdj_smooth: 3
+  rsi_periods:
+  - 6
+  - 12
+  - 24
+pick:
+  output_dir: output
+  top_n: 50
+scoring:
+  require_all_dimensions: true
+  require_rsi_divergence: false
+  rsi_long_oversold: 35
+  threshold: 6
+tuner:
+  amp30_candidates:
+  - 0.12
+  - 0.15
+  - 0.2
+  atr_pct_ratio_candidates:
+  - 1.2
+  - 1.5
+  - 2.0
+  bb_width_quantile_candidates:
+  - 0.6
+  - 0.7
+  - 0.8
+  score_threshold_candidates:
+  - 5
+  - 6
+  - 7
+universe:
+  exclude_st: true
+  min_listed_days: 60
+volatility:
+  amp30_min: 0.12
+  atr_pct_ratio: 1.2
+  bb_width_quantile: 0.65
+  lookback: 90
+  min_avg_amount: 50000000
+  min_close: 3.0

@@ -1,6 +1,7 @@
 # ==================== 数据配置 ====================
 data:
   db_path: "data/kline.duckdb"
+  stock_data_db: "data/stock_data.db"  # 新数据源：5年后复权行情 + 股票信息
   ingest_since: "2025-04-01"          # 1年数据
   baostock_workers: 4                  # 并发拉取进程数(降低以减少BaoStock断连)
   retry: 3
@@ -10,21 +11,46 @@ universe:
   min_listed_days: 60                  # 次新股排除阈值
   exclude_st: true
 
-# ==================== 波动率门槛(PDF第一层筛选) ====================
+# ==================== 波动率门槛（三段时序版）====================
+# 目标：筛出「历史曾大涨放量、近期缩量横盘整理」的股票
+# 逻辑：历史大涨放量（60~25日前）→ 近期缩量横盘（30日）→ 当前未急跌
 volatility:
-  amp30_min: 0.15                      # 30日最大涨跌幅绝对值 ≥ 15%
-  atr_pct_ratio: 1.5                   # ATR%当前 > 近90日均值 × 1.5 (波动正在扩张)
-  bb_width_quantile: 0.80              # 带宽 ≥ 近90日 80%分位 (高带宽)
-  lookback: 90                         # 历史回溯长度
+  # 基础门槛
+  min_close: 3.0                       # 收盘价 ≥ 3元
+  min_avg_amount: 50000000             # 5日均成交额 ≥ 5000万
 
-# ==================== 打分体系(满分9分) ====================
-# 每指标0-3分, BOLL+RSI+KDJ总分0-9分
-# 7-9: 强信号可建仓; 5-6: 弱信号轻仓; <5: 观望
+  # 第一段：历史曾大涨放量
+  rally_lookback: 60                   # 历史窗口（日）
+  rally_min_pct: 0.25                  # 最小涨幅 25%
+  rally_vol_ratio: 1.3                 # 上涨段均量 > 90日均量×1.3
+  rally_min_days: 5                    # 上涨段最少持续天数
+
+  # 第二段：近期缩量横盘
+  consol_window: 30                    # 横盘检测窗口（日）
+  range_max_pct: 0.20                  # 近30日价格区间/均价 ≤ 20%
+  drawdown_min: 0.40                   # 当前价 ≥ 60日高点×40%
+  drawdown_max: 0.90                   # 当前价 ≤ 60日高点×90%
+  vol_shrink_ratio: 0.80               # 近10日均量 < 近30日均量×0.80
+  atr_shrink_ratio: 0.85               # 近10日ATR < 近30日ATR×0.85
+
+  # 第三段：当前未在急跌
+  cum_5d_min: -0.10                    # 近5日累计跌幅 > -10%
+
+  # 旧接口兼容（不再使用）
+  amp30_min: 0.15
+  atr_pct_ratio: 1.2
+  bb_width_quantile: 0.65
+  lookback: 90
+
+# ==================== 打分体系（重构版，满分15分）====================
+# 5维度：BOLL + RSI + KDJ + 量价 + 蜡烛，每维度0-3分
+# 必要条件：BOLL≥1（触及下轨）+ 量价≥1 或 蜡烛≥2
+# 总分 ≥ 10 入选
 scoring:
-  threshold: 7                         # 仅入选强信号
-  require_all_dimensions: true         # 三指标必须都 ≥ 1 分(共振)
-  require_rsi_divergence: true         # RSI看涨底背离作为必要条件
-  rsi_long_oversold: 35                # RSI12 视为超卖的阈值(PDF推荐30,波动剧烈期可放宽到35)
+  threshold: 9                         # 总分 ≥ 9（满分15）
+  require_all_dimensions: true         # 保留兼容接口
+  require_rsi_divergence: false        # RSI底背离为加分项，非硬性要求（得分已体现）
+  rsi_long_oversold: 40                # RSI6 < 40 视为超卖
 
 # ==================== 指标参数(用户指定) ====================
 indicators:
@@ -42,7 +68,7 @@ pick:
 
 # ==================== 回测配置 ====================
 backtest:
-  start_date: "2025-07-01"
+  start_date: "2021-01-04"
   end_date: "2026-04-25"
   out_of_sample_start: "2025-04-01"
   out_of_sample_end: "2025-06-30"
@@ -56,6 +82,14 @@ backtest:
     hold20_return_mean: 0.03           # 20日平均收益
     hold20_max_loss: -0.25             # 20日最大单笔亏损
     any_win_rate: 0.50                 # 任一持有期总胜率
+
+# ==================== 妙想 API ====================
+miao:
+  api_key: ""   # 留空则自动从环境变量 MX_APIKEY 读取
+  # 使用方式：
+  #   python run.py miao-data   --query "贵州茅台近一年收盘价"
+  #   python run.py miao-search --query "宁德时代最新研报"
+  #   python run.py miao-xuangu --query "今日A股主板涨幅大于5%"
 
 # ==================== 调参网格 ====================
 tuner:

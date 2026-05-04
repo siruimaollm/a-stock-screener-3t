@@ -163,11 +163,14 @@ def ingest(codes: list, db_path: str,
         last = meta_map.get(code)
         if last:
             last_dt = datetime.strptime(last, "%Y-%m-%d")
-            # skip if data is within 5 calendar days of end_date
-            # (handles weekends/holidays where BaoStock hasn't published today yet)
-            if (end_dt - last_dt).days <= 5:
+            # 仅当本地数据已覆盖到（或超过）end_date 时才跳过
+            # 此前的 "5 天缓冲" 会导致周一收盘后 4/24→4/27 这种正常增量被跳过
+            if last_dt >= end_dt:
                 continue
-        fetch_from = last if last else start_date
+            # 增量起点 = 上次最后日期的次日，避免重复拉取已有日期
+            fetch_from = (last_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            fetch_from = start_date
         todo.append((code, fetch_from, end_date))
 
     if not todo:
@@ -244,6 +247,75 @@ def load_all_kline(db_path: str,
     df = conn.execute(q, params).df()
     conn.close()
     return df
+
+
+def load_all_kline_sqlite(db_path: str,
+                          table: str = "daily_data_hfq",
+                          start_date: str | None = None,
+                          end_date: str | None = None) -> pd.DataFrame:
+    """
+    Load kline from stock_data.db (SQLite, UTF-8).
+
+    Columns in source: stock_code, date, open, high, low, close,
+                       volume, amount, turnover_rate
+    Returned columns:  code, date, open, high, low, close,
+                       volume, amount, turn, pct_chg, preclose
+    """
+    import sqlite3
+
+    con = sqlite3.connect(db_path)
+    where_parts, params = [], []
+    if start_date:
+        where_parts.append("date >= ?")
+        params.append(start_date)
+    if end_date:
+        where_parts.append("date <= ?")
+        params.append(end_date)
+    where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    sql = f"SELECT * FROM {table} {where_sql} ORDER BY stock_code, date"
+    df = pd.read_sql_query(sql, con, params=params)
+    con.close()
+
+    # Rename to match existing pipeline schema
+    df = df.rename(columns={"stock_code": "code", "turnover_rate": "turn"})
+
+    # Compute preclose and pct_chg per stock
+    df = df.sort_values(["code", "date"]).reset_index(drop=True)
+    df["preclose"] = df.groupby("code")["close"].shift(1)
+    df["pct_chg"]  = (df["close"] - df["preclose"]) / df["preclose"].replace(0, float("nan"))
+
+    # Ensure numeric types
+    for col in ["open", "high", "low", "close", "preclose", "volume", "amount", "turn", "pct_chg"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
+
+
+def load_stock_info_sqlite(db_path: str) -> dict:
+    """
+    Load stock name + industry from stock_data.db (SQLite, UTF-8).
+    Returns {code: {"name": ..., "industry": ...}}.
+    """
+    import sqlite3
+
+    con = sqlite3.connect(db_path)
+    rows = con.execute(
+        "SELECT stock_code, stock_name, industry FROM stock_info"
+    ).fetchall()
+    con.close()
+
+    result = {}
+    for code, name, industry in rows:
+        try:
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", errors="replace")
+            if isinstance(industry, bytes):
+                industry = industry.decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        result[code] = {"name": name or "", "industry": industry or ""}
+    return result
 
 
 def get_db_stats(db_path: str) -> dict:

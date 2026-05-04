@@ -1,34 +1,51 @@
-# Data & outputs
-data/*.duckdb
-data/*.duckdb.wal
+# ── 数据文件（体积过大，不入库）──
+data/
+cache/
+
+# ── 输出结果（本地生成）──
 output/
 *.csv
+*.xlsx
 *.html
+*.json
 
-# Python
+# ── 日志 ──
+*.log
+fetch_err.txt
+fetch_log.txt
+ingest_err.txt
+ingest_log.txt
+
+# ── Python ──
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+*.egg-info/
+dist/
+build/
 .venv/
 venv/
 env/
 .env
 
-# IDE
+# ── IDE ──
 .vscode/
 .idea/
 .claude/
 *.swp
 *.swo
 
-# OS
+# ── OS ──
 .DS_Store
 Thumbs.db
 
-# Tuned config (generated)
+# ── 调参产物 ──
 config_tuned.yaml
 
-# Logs
-*.log
+# ── 妙想技能包（第三方，不入库）──
+miao_skills/
+
+# ── DuckDB WAL ──
+*.duckdb.wal

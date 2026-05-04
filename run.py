@@ -9,7 +9,9 @@ Usage:
   python run.py          (runs all four steps in sequence)
 """
 import argparse
+import json
 import os
+import re
 import sys
 from datetime import datetime, date
 from typing import Optional
@@ -157,10 +159,7 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
 
     conn.close()
 
-    vol_cfg = {"amp30_min": cfg["volatility"]["amp30_min"],
-               "atr_pct_ratio": cfg["volatility"]["atr_pct_ratio"],
-               "bb_width_quantile": cfg["volatility"]["bb_width_quantile"],
-               "lookback": cfg["volatility"].get("lookback", 90)}
+    vol_cfg = _build_vol_cfg(cfg)
     score_cfg = {"threshold": cfg["scoring"]["threshold"],
                  "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
                  "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", True),
@@ -257,7 +256,7 @@ def _fetch_benchmark(code: str, start: str, end: str) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = None):
     import pandas as pd
-    import duckdb
+    from src.data_fetcher import load_all_kline_sqlite
     from src.indicators import add_all_indicators
     from src.volatility_filter import passes_volatility
     from src.scoring import score_all
@@ -269,28 +268,22 @@ def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = 
     if pick_date is None:
         pick_date = _last_trading_date()
     n = top_n or cfg["pick"]["top_n"]
-    db_path = cfg["data"]["db_path"]
+    sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
 
-    # need ~120 bars before pick_date
+    # need ~120 bars before pick_date for indicators
     from datetime import datetime as dt, timedelta
     since_dt = dt.strptime(pick_date, "%Y-%m-%d") - timedelta(days=200)
     since = since_dt.strftime("%Y-%m-%d")
 
-    conn = duckdb.connect(db_path, read_only=True)
-    all_kline = conn.execute(
-        "SELECT * FROM daily_kline WHERE date >= ? AND date <= ? ORDER BY code, date",
-        [since, pick_date]
-    ).df()
-    conn.close()
+    print(f"加载行情数据（{since} ~ {pick_date}）...")
+    all_kline = load_all_kline_sqlite(sqlite_path, table="daily_data_hfq",
+                                      start_date=since, end_date=pick_date)
 
     if all_kline.empty:
-        print("No data in DB. Run ingest first.")
+        print("No data in stock_data.db. Please check the database.")
         return
 
-    vol_cfg = {"amp30_min": cfg["volatility"]["amp30_min"],
-               "atr_pct_ratio": cfg["volatility"]["atr_pct_ratio"],
-               "bb_width_quantile": cfg["volatility"]["bb_width_quantile"],
-               "lookback": cfg["volatility"].get("lookback", 90)}
+    vol_cfg = _build_vol_cfg(cfg)
     score_cfg = cfg["scoring"]
 
     print(f"Computing indicators for {all_kline['code'].nunique()} stocks ...")
@@ -315,16 +308,35 @@ def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = 
     print(f"  Volatility gate: {len(filtered)} / {len(stock_data)} passed")
 
     print("Scoring ...")
+    require_div = score_cfg.get("require_rsi_divergence", True)
+    divergence_relaxed = False
+
     picks = score_all(filtered,
                       threshold=score_cfg["threshold"],
                       require_all_dimensions=score_cfg.get("require_all_dimensions", True),
-                      require_rsi_divergence=score_cfg.get("require_rsi_divergence", True),
+                      require_rsi_divergence=require_div,
                       rsi_long_oversold=score_cfg.get("rsi_long_oversold", 30))
+
+    # 严格模式结果过少时（<5），自动放开 RSI 底背离要求
+    if len(picks) < 5 and require_div:
+        print(f"  [严格模式] 仅 {len(picks)} 只入选，放开 RSI 底背离条件后重试 ...")
+        picks = score_all(filtered,
+                          threshold=score_cfg["threshold"],
+                          require_all_dimensions=score_cfg.get("require_all_dimensions", True),
+                          require_rsi_divergence=False,
+                          rsi_long_oversold=score_cfg.get("rsi_long_oversold", 30))
+        divergence_relaxed = True
+
     picks = picks[:n]
-    print(f"  Selected: {len(picks)} stocks")
+    mode_label = "宽松(无底背离要求)" if divergence_relaxed else "严格(含底背离)"
+    print(f"  Selected: {len(picks)} stocks  [模式: {mode_label}]")
+
+    # 给每条结果标注选股模式，方便报告展示
+    for p in picks:
+        p["mode"] = mode_label
 
     # Fetch stock meta (name + industry)
-    meta = _get_stock_meta(db_path)
+    meta = _get_stock_meta(cfg)
 
     date_str = pick_date.replace("-", "")
     out_dir = cfg["pick"]["output_dir"]
@@ -339,10 +351,277 @@ def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = 
     print(f"HTML: {os.path.abspath(html_path)}")
 
 
-def _get_stock_meta(db_path: str) -> dict:
-    """Load stock name/industry from DB cache (written during ingest). No network call."""
+def cmd_backtest_tp(cfg: dict):
+    """10%止盈/5%止损回测。"""
+    from src.data_fetcher import load_all_kline_sqlite
+    from src.backtest_tp import run_tp_backtest
+
+    print("\n=== 止盈止损回测（+10% / -5%）===")
+    sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
+    bt_cfg  = cfg.get("backtest", {})
+    start   = bt_cfg.get("start_date", "2025-07-01")
+    end     = bt_cfg.get("end_date",   "2026-04-25")
+
+    print(f"加载 {start} ~ {end} 全市场日线（5年后复权）...")
+    from datetime import datetime, timedelta
+    hist_start = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=220)).strftime("%Y-%m-%d")
+    all_kline = load_all_kline_sqlite(sqlite_path, table="daily_data_hfq",
+                                      start_date=hist_start, end_date=end)
+    print(f"  共 {len(all_kline)} 行，{all_kline['code'].nunique()} 只股票")
+
+    vol_cfg = _build_vol_cfg(cfg)
+    score_cfg = {
+        "threshold":             cfg["scoring"]["threshold"],
+        "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
+        "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
+        "rsi_long_oversold":      cfg["scoring"].get("rsi_long_oversold", 40),
+    }
+    ind_cfg = {
+        "rsi_periods": cfg["indicators"]["rsi_periods"],
+        "kdj_period":  cfg["indicators"]["kdj_period"],
+        "kdj_smooth":  cfg["indicators"]["kdj_smooth"],
+        "boll_period": cfg["indicators"]["boll_period"],
+        "boll_std":    cfg["indicators"]["boll_std"],
+        "atr_period":  cfg["indicators"]["atr_period"],
+    }
+
+    result = run_tp_backtest(
+        all_kline, vol_cfg, score_cfg, ind_cfg,
+        start_date=start, end_date=end,
+        take_profit=0.10, stop_loss=0.05,
+        max_hold=60, signal_freq="biweekly",
+    )
+
+    if result.get("total_trades", 0) == 0:
+        print("无有效交易，请检查策略参数或扩大回测区间。")
+        return
+
+    print(f"\n{'='*50}")
+    print(f"回测区间: {start} ~ {end}")
+    print(f"总交易笔数:   {result['total_trades']}")
+    print(f"胜率(盈利):   {result['win_rate']:.1%}")
+    print(f"  止盈触发:   {result['tp_rate']:.1%}  ({result['take_profit']:.0%})")
+    print(f"  止损触发:   {result['sl_rate']:.1%}  (-{result['stop_loss']:.0%})")
+    print(f"  超时平仓:   {result['timeout_rate']:.1%}")
+    print(f"平均收益:     {result['mean_return']:.2%}")
+    print(f"中位数收益:   {result['median_return']:.2%}")
+    print(f"最佳单笔:     {result['max_return']:.2%}")
+    print(f"最差单笔:     {result['min_return']:.2%}")
+    print(f"平均持有天数: {result['mean_hold_days']:.1f} 日")
+    print(f"{'='*50}")
+
+    # 保存明细
+    out_dir = cfg["pick"]["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    detail_path = os.path.join(out_dir, "backtest_tp_detail.csv")
+    result["trades_df"].to_csv(detail_path, index=False, encoding="utf-8-sig")
+    print(f"明细已保存: {detail_path}")
+
+
+def cmd_backtest_vbt(cfg: dict):
+    """VectorBT 向量化止盈止损回测（比 backtest-tp 快 10-20x）。"""
+    from src.data_fetcher import load_all_kline_sqlite
+    from src.backtest_vbt import run_vbt_backtest
+
+    print("\n=== VectorBT 向量化回测（+10% / -5%）===")
+    sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
+    bt_cfg  = cfg.get("backtest", {})
+    start   = bt_cfg.get("start_date", "2025-07-01")
+    end     = bt_cfg.get("end_date",   "2026-04-25")
+
+    print(f"加载 {start} ~ {end} 全市场日线...")
+    from datetime import datetime, timedelta
+    hist_start = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=220)).strftime("%Y-%m-%d")
+    all_kline = load_all_kline_sqlite(sqlite_path, table="daily_data_hfq",
+                                      start_date=hist_start, end_date=end)
+    print(f"  共 {len(all_kline)} 行，{all_kline['code'].nunique()} 只股票")
+
+    vol_cfg = _build_vol_cfg(cfg)
+    score_cfg = {
+        "threshold":              cfg["scoring"]["threshold"],
+        "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
+        "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
+        "rsi_long_oversold":      cfg["scoring"].get("rsi_long_oversold", 40),
+    }
+    ind_cfg = {
+        "rsi_periods": cfg["indicators"]["rsi_periods"],
+        "kdj_period":  cfg["indicators"]["kdj_period"],
+        "kdj_smooth":  cfg["indicators"]["kdj_smooth"],
+        "boll_period": cfg["indicators"]["boll_period"],
+        "boll_std":    cfg["indicators"]["boll_std"],
+        "atr_period":  cfg["indicators"]["atr_period"],
+    }
+
+    result = run_vbt_backtest(
+        all_kline, vol_cfg, score_cfg, ind_cfg,
+        start_date=start, end_date=end,
+        take_profit=0.10, stop_loss=0.10,
+        max_hold=60, max_positions=5,
+        signal_freq="biweekly",
+    )
+
+    if result.get("total_trades", 0) == 0:
+        print("无有效交易，请检查策略参数或扩大回测区间。")
+        return
+
+    print(f"\n{'='*55}")
+    print(f"回测区间: {start} ~ {end}")
+    print(f"总交易笔数:      {result['total_trades']}")
+    print(f"胜率(盈利):      {result['win_rate']:.1%}")
+    print(f"  止盈合计:      {result['tp_rate']:.1%}")
+    print(f"    └ +10%止盈:  {result.get('tp_pct_rate', 0):.1%}")
+    print(f"    └ 布林上轨:  {result.get('tp_boll_rate', 0):.1%}")
+    print(f"  止损(-10%):    {result['sl_rate']:.1%}")
+    print(f"  超时平仓:      {result['timeout_rate']:.1%}")
+    print(f"平均收益:        {result['mean_return']:.2%}")
+    print(f"中位数收益:      {result['median_return']:.2%}")
+    print(f"最佳单笔:        {result['max_return']:.2%}")
+    print(f"最差单笔:        {result['min_return']:.2%}")
+    print(f"平均持有天数:    {result['mean_hold_days']:.1f} 日")
+    print(f"{'='*55}")
+
+    out_dir = cfg["pick"]["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    detail_path = os.path.join(out_dir, "backtest_vbt_detail.csv")
+    result["trades_df"].to_csv(detail_path, index=False, encoding="utf-8-sig")
+    print(f"明细已保存: {detail_path}")
+
+
+# ─────────────────────────────────────────────
+#  妙想 API 命令
+# ─────────────────────────────────────────────
+
+def _miao_apikey(cfg: dict) -> Optional[str]:
+    """从 config.yaml 或环境变量获取 MX_APIKEY。"""
+    return cfg.get("miao", {}).get("api_key") or os.getenv("MX_APIKEY") or None
+
+
+def cmd_miao_data(cfg: dict, question: str):
+    """妙想金融数据查询。"""
+    from src.miao_api import MiaoData
+
+    api_key = _miao_apikey(cfg)
+    client = MiaoData(api_key=api_key)
+
+    print(f"\n[妙想金融数据] 查询: {question}")
+    result = client.query(question)
+    tables, err = client.to_dataframes(result)
+
+    if err:
+        print(f"错误: {err}")
+        raw = json.dumps(result, ensure_ascii=False)[:800]
+        print(f"原始响应片段: {raw}")
+        return
+
+    out_dir = cfg["pick"]["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+
+    for t in tables:
+        df = t["df"]
+        print(f"\n── {t['name']} ({len(df)} 行) ──")
+        print(df.to_string(index=False, max_rows=20))
+
+        # 保存 CSV
+        safe = re.sub(r'[<>:"/\\|?*\[\] ]', "_", question)[:40]
+        csv_path = os.path.join(out_dir, f"miao_data_{safe}.csv")
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        print(f"  已保存: {csv_path}")
+
+    # 保存原始 JSON
+    safe = re.sub(r'[<>:"/\\|?*\[\] ]', "_", question)[:40]
+    json_path = os.path.join(out_dir, f"miao_data_{safe}_raw.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"原始JSON: {json_path}")
+
+
+def cmd_miao_search(cfg: dict, question: str):
+    """妙想资讯搜索。"""
+    from src.miao_api import MiaoSearch
+
+    api_key = _miao_apikey(cfg)
+    client = MiaoSearch(api_key=api_key)
+
+    print(f"\n[妙想资讯搜索] 查询: {question}")
+    result = client.search(question)
+    text = client.to_text(result)
+    print(text)
+
+    out_dir = cfg["pick"]["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    safe = re.sub(r'[<>:"/\\|?*\[\] ]', "_", question)[:40]
+    txt_path = os.path.join(out_dir, f"miao_search_{safe}.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"\n已保存: {txt_path}")
+
+
+def cmd_miao_xuangu(cfg: dict, condition: str):
+    """妙想智能选股。"""
+    from src.miao_api import MiaoXuangu
+
+    api_key = _miao_apikey(cfg)
+    client = MiaoXuangu(api_key=api_key)
+
+    print(f"\n[妙想智能选股] 条件: {condition}")
+    result = client.screen(condition)
+    df, total, err = client.to_dataframe(result)
+
+    if err:
+        print(f"错误: {err}")
+        raw = json.dumps(result, ensure_ascii=False)[:800]
+        print(f"原始响应片段: {raw}")
+        return
+
+    print(f"\n符合条件股票: {total} 只，返回 {len(df)} 行")
+    if not df.empty:
+        print(df.to_string(index=False, max_rows=30))
+
+    out_dir = cfg["pick"]["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    safe = re.sub(r'[<>:"/\\|?*\[\] ]', "_", condition)[:40]
+    csv_path = os.path.join(out_dir, f"miao_xuangu_{safe}.csv")
+    df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    print(f"\n已保存: {csv_path}")
+
+    json_path = os.path.join(out_dir, f"miao_xuangu_{safe}_raw.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"原始JSON: {json_path}")
+
+
+def _build_vol_cfg(cfg: dict) -> dict:
+    """从 config.yaml 的 volatility 节构建 passes_volatility 参数字典。"""
+    v = cfg["volatility"]
+    return {
+        # 基础门槛
+        "min_close":        v.get("min_close", 3.0),
+        "min_avg_amount":   v.get("min_avg_amount", 5e7),
+        # 第一段：历史曾大涨
+        "rally_lookback":   v.get("rally_lookback", 60),
+        "rally_min_pct":    v.get("rally_min_pct", 0.25),
+        "rally_vol_ratio":  v.get("rally_vol_ratio", 1.3),
+        "rally_min_days":   v.get("rally_min_days", 5),
+        # 第二段：缩量横盘
+        "consol_window":    v.get("consol_window", 30),
+        "range_max_pct":    v.get("range_max_pct", 0.12),
+        "drawdown_min":     v.get("drawdown_min", 0.40),
+        "drawdown_max":     v.get("drawdown_max", 0.80),
+        "vol_shrink_ratio": v.get("vol_shrink_ratio", 0.6),
+        "atr_shrink_ratio": v.get("atr_shrink_ratio", 0.75),
+        # 第三段：未急跌
+        "cum_5d_min":       v.get("cum_5d_min", -0.10),
+    }
+
+
+def _get_stock_meta(cfg: dict) -> dict:
+    """Load stock name/industry. Prefers new stock_data.db, falls back to BaoStock cache."""
+    sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
+    if os.path.exists(sqlite_path):
+        from src.data_fetcher import load_stock_info_sqlite
+        return load_stock_info_sqlite(sqlite_path)
     from src.data_fetcher import load_stock_basic
-    return load_stock_basic(db_path)
+    return load_stock_basic(cfg["data"]["db_path"])
 
 
 # ─────────────────────────────────────────────
@@ -351,7 +630,9 @@ def _get_stock_meta(db_path: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="A股主板反转选股策略")
     parser.add_argument("command", nargs="?",
-                        choices=["validate", "ingest", "backtest", "pick"],
+                        choices=["validate", "ingest", "backtest", "pick",
+                                 "backtest-tp", "backtest-vbt",
+                                 "miao-data", "miao-search", "miao-xuangu"],
                         default=None)
     parser.add_argument("--code", default="sh.600519")
     parser.add_argument("--since", default=None)
@@ -359,6 +640,8 @@ def main():
     parser.add_argument("--date", default=None)
     parser.add_argument("--top", type=int, default=None)
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--query", default=None,
+                        help="妙想查询问句（用于 miao-data / miao-search / miao-xuangu）")
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -371,6 +654,19 @@ def main():
         cmd_backtest(cfg, args.auto_tune)
     elif args.command == "pick":
         cmd_pick(cfg, args.date, args.top)
+    elif args.command == "backtest-tp":
+        cmd_backtest_tp(cfg)
+    elif args.command == "backtest-vbt":
+        cmd_backtest_vbt(cfg)
+    elif args.command == "miao-data":
+        q = args.query or input("请输入查询问句: ")
+        cmd_miao_data(cfg, q)
+    elif args.command == "miao-search":
+        q = args.query or input("请输入搜索问句: ")
+        cmd_miao_search(cfg, q)
+    elif args.command == "miao-xuangu":
+        q = args.query or input("请输入选股条件: ")
+        cmd_miao_xuangu(cfg, q)
     else:
         # Full pipeline
         print("Running full pipeline: validate → ingest → backtest → pick")
