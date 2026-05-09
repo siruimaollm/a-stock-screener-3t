@@ -3,7 +3,7 @@ Build the A-share main board stock universe via BaoStock.
 
 Keeps:
   sh.600xxx / sh.601xxx / sh.603xxx / sh.605xxx
-  sz.000xxx / sz.001xxx
+  sz.000xxx / sz.001xxx / sz.002xxx / sz.003xxx
 
 Removes: ST/*ST, 科创板(688), 创业板(300), 北交所(8xx/4xx),
          newly listed < min_listed_days, suspended 3+ days recently.
@@ -16,7 +16,7 @@ import pandas as pd
 
 
 _MAIN_BOARD_PATTERN = re.compile(
-    r"^(sh\.6[0035]\d{4}|sz\.0[01]\d{4})$"
+    r"^(sh\.(?:600|601|603|605)\d{3}|sz\.(?:000|001|002|003)\d{3})$"
 )
 
 

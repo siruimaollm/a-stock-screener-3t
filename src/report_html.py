@@ -128,7 +128,7 @@ def _kline_chart(df: pd.DataFrame, title: str = "", n_bars: int = 60) -> Grid:
 
 def _score_table_html(picks_df: pd.DataFrame) -> str:
     cols = ["rank", "code", "name", "industry", "total_score",
-            "rsi_score", "kdj_score", "boll_score", "vol_score",
+            "confirmation_tier", "rsi_score", "kdj_score", "boll_score", "vol_score",
             "close", "rsi6", "J", "bb_width", "amp30", "signals"]
     cols = [c for c in cols if c in picks_df.columns]
     rows_html = ""

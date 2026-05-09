@@ -18,7 +18,7 @@ Layer 1 — 波动率过滤（三段时序验证版 · 优化）
   第二段 — 近期缩量整理（最近 consol_window 日）
     4. 价格区间/均价 ≤ range_max_pct（价格收敛，已横盘）
     5. 当前价 ≥ 60日高点的 drawdown_min ~ drawdown_max（回撤受控）
-    6. 近10日均量 < 近30日均量×vol_shrink_ratio（缩量已成事实）
+    6. 近10日均量 < 更长周期均量（默认 60 日，方向性缩量）
     7. 近10日 ATR% < 近30日 ATR%×atr_shrink_ratio（波动率收敛）
 
   第三段 — 当前未急跌
@@ -47,6 +47,9 @@ def passes_volatility(
     range_max_pct: float = 0.20,
     drawdown_min: float = 0.40,
     drawdown_max: float = 0.90,
+    directional_vol_shrink: bool = True,
+    vol_shrink_short_window: int = 10,
+    vol_shrink_long_window: int = 60,
     vol_shrink_ratio: float = 0.80,
     atr_shrink_ratio: float = 0.85,
     # 第三段：未在急跌
@@ -140,9 +143,19 @@ def passes_volatility(
     if not (drawdown_min <= dist_ratio <= drawdown_max):
         return False
 
-    vol_10d = vol_arr[-10:].mean()
-    vol_30d = vol_arr[-30:].mean()
-    if vol_30d <= 0 or vol_10d / vol_30d > vol_shrink_ratio:
+    short_window = max(int(vol_shrink_short_window), 1)
+    long_window = max(int(vol_shrink_long_window), short_window + 1)
+    if n < long_window:
+        return False
+
+    vol_short = vol_arr[-short_window:].mean()
+    vol_long = vol_arr[-long_window:].mean()
+    if vol_long <= 0:
+        return False
+    if directional_vol_shrink:
+        if vol_short >= vol_long:
+            return False
+    elif vol_short / vol_long > vol_shrink_ratio:
         return False
 
     # ATR 收敛检查（用 atr_pct，与 indicators.py 一致）

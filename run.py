@@ -3,7 +3,7 @@ Main CLI entry point.
 
 Usage:
   python run.py validate [--code sh.600519]
-  python run.py ingest [--since 2022-04-01]
+  python run.py ingest [--end-date 2022-04-01]
   python run.py backtest [--auto-tune]
   python run.py pick [--date YYYYMMDD] [--top N]
   python run.py          (runs all four steps in sequence)
@@ -26,10 +26,63 @@ def _load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def _last_trading_date() -> str:
+def _latest_available_pick_date(cfg: dict) -> str:
+    """
+    Prefer the latest trade date already present in stock_data.db.
+    Fall back to today's calendar date when the DB is unavailable.
+    """
+    from src.data_fetcher import get_latest_trade_date_sqlite
+
+    sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
+    latest = None
+    if os.path.exists(sqlite_path):
+        latest = get_latest_trade_date_sqlite(sqlite_path, table="daily_data_hfq")
+    if latest:
+        return latest
+
     today = date.today()
-    # return today's date; BaoStock will handle non-trading-day gaps
     return today.strftime("%Y-%m-%d")
+
+
+def _latest_available_backtest_end_date(cfg: dict) -> str:
+    """
+    Prefer the latest trade date already present in stock_data.db.
+    Fall back to configured backtest.end_date, then today's calendar date.
+    """
+    from src.data_fetcher import get_latest_trade_date_sqlite
+
+    sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
+    latest = None
+    if os.path.exists(sqlite_path):
+        latest = get_latest_trade_date_sqlite(sqlite_path, table="daily_data_hfq")
+    if latest:
+        return latest
+
+    configured = cfg.get("backtest", {}).get("end_date")
+    if configured:
+        return configured
+
+    today = date.today()
+    return today.strftime("%Y-%m-%d")
+
+
+def _dated_output_path(output_dir: str, prefix: str, end_date: str,
+                       suffix: str = "") -> str:
+    """
+    Build an output path anchored on backtest end date and avoid name collisions.
+    """
+    date_str = end_date.replace("-", "")
+    ext = suffix if suffix.startswith(".") else suffix
+    base = os.path.join(output_dir, f"{prefix}_{date_str}{ext}")
+    if not os.path.exists(base):
+        return base
+
+    idx = 1
+    while True:
+        candidate = os.path.join(output_dir, f"{prefix}_{date_str}_{idx}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
 
 
 # ─────────────────────────────────────────────
@@ -92,12 +145,21 @@ def cmd_validate(cfg: dict, code: str = "sh.600519"):
 # ─────────────────────────────────────────────
 #  INGEST
 # ─────────────────────────────────────────────
-def cmd_ingest(cfg: dict, since: Optional[str] = None):
+def cmd_ingest(cfg: dict,
+               end_date: Optional[str] = None,
+               since: Optional[str] = None):
     from src.data_fetcher import update_stock_data
 
     print("\n=== STEP 2: 增量更新 stock_data.db ===")
     stock_db = cfg["data"].get("stock_data_db", "data/stock_data.db")
     today = datetime.today().strftime("%Y-%m-%d")
+
+    if end_date and since and end_date != since:
+        print("ERROR: --end-date and deprecated --since conflict. Please use only --end-date.")
+        sys.exit(2)
+    if since:
+        print("WARNING: ingest --since is deprecated; use --end-date instead.")
+    target_date = end_date or since or today
 
     print("Logging in to BaoStock ...")
     lg = bs.login()
@@ -107,7 +169,7 @@ def cmd_ingest(cfg: dict, since: Optional[str] = None):
 
     stats = update_stock_data(
         db_path=stock_db,
-        end_date=since or today,
+        end_date=target_date,
         workers=cfg["data"].get("baostock_workers", 4),
         retry=cfg["data"].get("retry", 3),
     )
@@ -127,6 +189,7 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
     print("\n=== STEP 3: Backtest ===")
     stock_db = cfg["data"].get("stock_data_db", "data/stock_data.db")
     bt_cfg = cfg["backtest"]
+    end_date = _latest_available_backtest_end_date(cfg)
     pass_criteria = bt_cfg["pass_criteria"]
     hold_periods = bt_cfg["hold_periods"]
 
@@ -134,10 +197,11 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
     from datetime import datetime as _dt, timedelta as _td
     hist_start = (_dt.strptime(bt_cfg["start_date"], "%Y-%m-%d") - _td(days=220)).strftime("%Y-%m-%d")
 
-    print(f"Loading main board kline ({hist_start} ~ {bt_cfg['end_date']}) ...")
+    print(f"Using latest available backtest end date: {end_date}")
+    print(f"Loading main board kline ({hist_start} ~ {end_date}) ...")
     all_kline = load_all_kline_sqlite(stock_db, table="daily_data_hfq",
                                       start_date=hist_start,
-                                      end_date=bt_cfg["end_date"])
+                                      end_date=end_date)
     print(f"  {len(all_kline)} rows, {all_kline['code'].nunique()} stocks")
 
     # 基准指数：从 index_data 表读取（代码去掉 sh./sz. 前缀）
@@ -146,16 +210,22 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
     print(f"Loading benchmark {bench_code} from index_data ...")
     bench_kline = load_benchmark_kline(stock_db, index_code=bench_code,
                                        start_date=bt_cfg["start_date"],
-                                       end_date=bt_cfg["end_date"])
+                                       end_date=end_date)
     if bench_kline.empty:
         print("  Benchmark not found in index_data, fetching via BaoStock ...")
-        bench_kline = _fetch_benchmark(bench_code_raw, bt_cfg["start_date"], bt_cfg["end_date"])
+        bench_kline = _fetch_benchmark(bench_code_raw, bt_cfg["start_date"], end_date)
 
     vol_cfg = _build_vol_cfg(cfg)
     score_cfg = {"threshold": cfg["scoring"]["threshold"],
                  "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
                  "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
-                 "rsi_long_oversold": cfg["scoring"].get("rsi_long_oversold", 40)}
+                 "rsi_long_oversold": cfg["scoring"].get("rsi_long_oversold", 40),
+                 "strong_confirmation_threshold": cfg["scoring"].get("strong_confirmation_threshold"),
+                 "weak_confirmation_threshold": cfg["scoring"].get("weak_confirmation_threshold"),
+                 "min_candle_score": cfg["scoring"].get("min_candle_score", 0),
+                 "min_vol_score": cfg["scoring"].get("min_vol_score", 0),
+                 "min_total_score": cfg["scoring"].get("min_total_score"),
+                 "require_rsi_or_kdj_score_sum": cfg["scoring"].get("require_rsi_or_kdj_score_sum", 0)}
     ind_cfg = {
         "rsi_periods": cfg["indicators"]["rsi_periods"],
         "kdj_period":  cfg["indicators"]["kdj_period"],
@@ -166,7 +236,7 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
     }
 
     results = run_backtest(all_kline, bench_kline,
-                           bt_cfg["start_date"], bt_cfg["end_date"],
+                           bt_cfg["start_date"], end_date,
                            hold_periods, bt_cfg["top_n"],
                            vol_cfg, score_cfg, ind_cfg)
 
@@ -211,10 +281,9 @@ def cmd_backtest(cfg: dict, auto_tune: bool = False):
             passed = False
 
     out_dir = cfg["pick"]["output_dir"]
-    date_str = datetime.today().strftime("%Y%m%d")
-    out_path = os.path.join(out_dir, f"backtest_{date_str}.html")
+    out_path = _dated_output_path(out_dir, "backtest", end_date, ".html")
     save_backtest_html(results, hold_periods, failed, passed, auto_tuned,
-                       out_path, bt_cfg["start_date"], bt_cfg["end_date"])
+                       out_path, bt_cfg["start_date"], end_date)
 
     for h in hold_periods:
         m = results.get(f"metrics_{h}", {})
@@ -263,7 +332,7 @@ def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = 
     print("\n=== STEP 4: Pick stocks ===")
 
     if pick_date is None:
-        pick_date = _last_trading_date()
+        pick_date = _latest_available_pick_date(cfg)
     n = top_n or cfg["pick"]["top_n"]
     sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
 
@@ -312,7 +381,13 @@ def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = 
                       threshold=score_cfg["threshold"],
                       require_all_dimensions=score_cfg.get("require_all_dimensions", True),
                       require_rsi_divergence=require_div,
-                      rsi_long_oversold=score_cfg.get("rsi_long_oversold", 30))
+                      rsi_long_oversold=score_cfg.get("rsi_long_oversold", 30),
+                      strong_confirmation_threshold=score_cfg.get("strong_confirmation_threshold"),
+                      weak_confirmation_threshold=score_cfg.get("weak_confirmation_threshold"),
+                      min_candle_score=score_cfg.get("min_candle_score", 0),
+                      min_vol_score=score_cfg.get("min_vol_score", 0),
+                      min_total_score=score_cfg.get("min_total_score"),
+                      require_rsi_or_kdj_score_sum=score_cfg.get("require_rsi_or_kdj_score_sum", 0))
 
     # 严格模式结果过少时（<5），自动放开 RSI 底背离要求
     if len(picks) < 5 and require_div:
@@ -321,7 +396,13 @@ def cmd_pick(cfg: dict, pick_date: Optional[str] = None, top_n: Optional[int] = 
                           threshold=score_cfg["threshold"],
                           require_all_dimensions=score_cfg.get("require_all_dimensions", True),
                           require_rsi_divergence=False,
-                          rsi_long_oversold=score_cfg.get("rsi_long_oversold", 30))
+                          rsi_long_oversold=score_cfg.get("rsi_long_oversold", 30),
+                          strong_confirmation_threshold=score_cfg.get("strong_confirmation_threshold"),
+                          weak_confirmation_threshold=score_cfg.get("weak_confirmation_threshold"),
+                          min_candle_score=score_cfg.get("min_candle_score", 0),
+                          min_vol_score=score_cfg.get("min_vol_score", 0),
+                          min_total_score=score_cfg.get("min_total_score"),
+                          require_rsi_or_kdj_score_sum=score_cfg.get("require_rsi_or_kdj_score_sum", 0))
         divergence_relaxed = True
 
     picks = picks[:n]
@@ -358,20 +439,22 @@ def cmd_backtest_v2(cfg: dict):
     print("\n=== STEP 3 (v2): 优化版历史回测 ===")
     stock_db = cfg["data"].get("stock_data_db", "data/stock_data.db")
     bt_cfg = cfg["backtest"]
+    end_date = _latest_available_backtest_end_date(cfg)
 
     hist_start = (_dt.strptime(bt_cfg["start_date"], "%Y-%m-%d") - _td(days=220)).strftime("%Y-%m-%d")
 
-    print(f"加载行情 ({hist_start} ~ {bt_cfg['end_date']}) ...")
+    print(f"使用最新可用回测结束日: {end_date}")
+    print(f"加载行情 ({hist_start} ~ {end_date}) ...")
     all_kline = load_all_kline_sqlite(stock_db, table="daily_data_hfq",
                                       start_date=hist_start,
-                                      end_date=bt_cfg["end_date"])
+                                      end_date=end_date)
     print(f"  {len(all_kline):,} 行, {all_kline['code'].nunique()} 只股票")
 
     bench_code = bt_cfg["benchmark"].split(".")[-1]
     print(f"加载基准 {bench_code} ...")
     bench_kline = load_benchmark_kline(stock_db, index_code=bench_code,
                                        start_date=bt_cfg["start_date"],
-                                       end_date=bt_cfg["end_date"])
+                                       end_date=end_date)
 
     vol_cfg = _build_vol_cfg(cfg)
     score_cfg = {
@@ -379,6 +462,12 @@ def cmd_backtest_v2(cfg: dict):
         "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
         "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
         "rsi_long_oversold":      cfg["scoring"].get("rsi_long_oversold", 40),
+        "strong_confirmation_threshold": cfg["scoring"].get("strong_confirmation_threshold"),
+        "weak_confirmation_threshold": cfg["scoring"].get("weak_confirmation_threshold"),
+        "min_candle_score": cfg["scoring"].get("min_candle_score", 0),
+        "min_vol_score": cfg["scoring"].get("min_vol_score", 0),
+        "min_total_score": cfg["scoring"].get("min_total_score"),
+        "require_rsi_or_kdj_score_sum": cfg["scoring"].get("require_rsi_or_kdj_score_sum", 0),
     }
     ind_cfg = {
         "rsi_periods": cfg["indicators"]["rsi_periods"],
@@ -393,14 +482,28 @@ def cmd_backtest_v2(cfg: dict):
     break_down_pct = bt_v2_cfg.get("break_down_pct", 0.08)
     max_hold       = bt_v2_cfg.get("max_hold",       252)
     signal_freq    = bt_v2_cfg.get("signal_freq",    "biweekly")
+    stop_loss_mode = bt_v2_cfg.get("stop_loss_mode", "close")
+    fail_exit_days = bt_v2_cfg.get("fail_exit_days", 0)
+    fail_exit_min_return = bt_v2_cfg.get("fail_exit_min_return", 0.0)
+    min_candle_score = bt_v2_cfg.get("min_candle_score", 0)
+    min_vol_score = bt_v2_cfg.get("min_vol_score", 0)
+    min_total_score = bt_v2_cfg.get("min_total_score")
+    require_rsi_or_kdj_score_sum = bt_v2_cfg.get("require_rsi_or_kdj_score_sum", 0)
 
     result = run_backtest_v2(
         all_kline, bench_kline,
-        bt_cfg["start_date"], bt_cfg["end_date"],
+        bt_cfg["start_date"], end_date,
         top_n=bt_cfg["top_n"],
         vol_cfg=vol_cfg, score_cfg=score_cfg, ind_cfg=ind_cfg,
         take_profit=take_profit, break_down_pct=break_down_pct,
         max_hold=max_hold, signal_freq=signal_freq,
+        stop_loss_mode=stop_loss_mode,
+        fail_exit_days=fail_exit_days,
+        fail_exit_min_return=fail_exit_min_return,
+        min_candle_score=min_candle_score,
+        min_vol_score=min_vol_score,
+        min_total_score=min_total_score,
+        require_rsi_or_kdj_score_sum=require_rsi_or_kdj_score_sum,
     )
 
     metrics = result["metrics"]
@@ -408,9 +511,8 @@ def cmd_backtest_v2(cfg: dict):
 
     out_dir = cfg["pick"]["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
-    date_str = datetime.today().strftime("%Y%m%d")
-    out_html = os.path.join(out_dir, f"backtest_v2_{date_str}.html")
-    out_csv  = os.path.join(out_dir, f"backtest_v2_{date_str}_trades.csv")
+    out_html = _dated_output_path(out_dir, "backtest_v2", end_date, ".html")
+    out_csv  = _dated_output_path(out_dir, "backtest_v2_trades", end_date, ".csv")
 
     if not trades_df.empty:
         # 注入股票名称 / 行业（从 stock_info 表）
@@ -430,7 +532,7 @@ def cmd_backtest_v2(cfg: dict):
 
         trades_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
         save_backtest_v2_html(metrics, trades_df, out_html,
-                              bt_cfg["start_date"], bt_cfg["end_date"],
+                              bt_cfg["start_date"], end_date,
                               meta=meta)
 
     print()
@@ -471,6 +573,12 @@ def cmd_backtest_tp(cfg: dict):
         "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
         "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
         "rsi_long_oversold":      cfg["scoring"].get("rsi_long_oversold", 40),
+        "strong_confirmation_threshold": cfg["scoring"].get("strong_confirmation_threshold"),
+        "weak_confirmation_threshold": cfg["scoring"].get("weak_confirmation_threshold"),
+        "min_candle_score": cfg["scoring"].get("min_candle_score", 0),
+        "min_vol_score": cfg["scoring"].get("min_vol_score", 0),
+        "min_total_score": cfg["scoring"].get("min_total_score"),
+        "require_rsi_or_kdj_score_sum": cfg["scoring"].get("require_rsi_or_kdj_score_sum", 0),
     }
     ind_cfg = {
         "rsi_periods": cfg["indicators"]["rsi_periods"],
@@ -538,6 +646,12 @@ def cmd_backtest_vbt(cfg: dict):
         "require_all_dimensions": cfg["scoring"].get("require_all_dimensions", True),
         "require_rsi_divergence": cfg["scoring"].get("require_rsi_divergence", False),
         "rsi_long_oversold":      cfg["scoring"].get("rsi_long_oversold", 40),
+        "strong_confirmation_threshold": cfg["scoring"].get("strong_confirmation_threshold"),
+        "weak_confirmation_threshold": cfg["scoring"].get("weak_confirmation_threshold"),
+        "min_candle_score": cfg["scoring"].get("min_candle_score", 0),
+        "min_vol_score": cfg["scoring"].get("min_vol_score", 0),
+        "min_total_score": cfg["scoring"].get("min_total_score"),
+        "require_rsi_or_kdj_score_sum": cfg["scoring"].get("require_rsi_or_kdj_score_sum", 0),
     }
     ind_cfg = {
         "rsi_periods": cfg["indicators"]["rsi_periods"],
@@ -700,11 +814,14 @@ def _build_vol_cfg(cfg: dict) -> dict:
         "rally_min_days":   v.get("rally_min_days", 5),
         # 第二段：缩量横盘
         "consol_window":    v.get("consol_window", 30),
-        "range_max_pct":    v.get("range_max_pct", 0.12),
+        "range_max_pct":    v.get("range_max_pct", 0.20),
         "drawdown_min":     v.get("drawdown_min", 0.40),
-        "drawdown_max":     v.get("drawdown_max", 0.80),
-        "vol_shrink_ratio": v.get("vol_shrink_ratio", 0.6),
-        "atr_shrink_ratio": v.get("atr_shrink_ratio", 0.75),
+        "drawdown_max":     v.get("drawdown_max", 0.90),
+        "directional_vol_shrink": v.get("directional_vol_shrink", True),
+        "vol_shrink_short_window": v.get("vol_shrink_short_window", 10),
+        "vol_shrink_long_window": v.get("vol_shrink_long_window", 60),
+        "vol_shrink_ratio": v.get("vol_shrink_ratio", 0.80),
+        "atr_shrink_ratio": v.get("atr_shrink_ratio", 0.85),
         # 第三段：未急跌
         "cum_5d_min":       v.get("cum_5d_min", -0.10),
     }
@@ -731,7 +848,9 @@ def main():
                                  "miao-data", "miao-search", "miao-xuangu"],
                         default=None)
     parser.add_argument("--code", default="sh.600519")
-    parser.add_argument("--since", default=None)
+    parser.add_argument("--end-date", default=None,
+                        help="ingest 截止日期，格式 YYYY-MM-DD；默认今天")
+    parser.add_argument("--since", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--auto-tune", action="store_true")
     parser.add_argument("--date", default=None)
     parser.add_argument("--top", type=int, default=None)
@@ -745,7 +864,7 @@ def main():
     if args.command == "validate":
         cmd_validate(cfg, args.code)
     elif args.command == "ingest":
-        cmd_ingest(cfg, args.since)
+        cmd_ingest(cfg, end_date=args.end_date, since=args.since)
     elif args.command == "backtest":
         cmd_backtest(cfg, args.auto_tune)
     elif args.command == "backtest-v2":

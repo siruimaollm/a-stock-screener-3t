@@ -8,6 +8,11 @@ print("=" * 50)
 print("[1] 数据状态")
 print("=" * 50)
 con = sqlite3.connect("data/stock_data.db")
+latest_daily_date = con.execute("SELECT MAX(date) FROM daily_data_hfq").fetchone()[0]
+latest_check_start = con.execute(
+    "SELECT DATE(?, '-30 days')",
+    (latest_daily_date,),
+).fetchone()[0]
 for tbl in ["daily_data_hfq", "index_data"]:
     r = con.execute(f"SELECT COUNT(*), MIN(date), MAX(date) FROM {tbl}").fetchone()
     print(f"  {tbl}: {r[0]:,} 行  {r[1]} ~ {r[2]}")
@@ -26,8 +31,9 @@ print("\n  近10交易日每日覆盖股票数:")
 rows = con.execute(
     "SELECT date, COUNT(DISTINCT stock_code) as n "
     "FROM daily_data_hfq "
-    "WHERE date >= (SELECT DATE(MAX(date), '-30 days') FROM daily_data_hfq) "
+    "WHERE date >= ? "
     "GROUP BY date ORDER BY date DESC LIMIT 10"
+    , (latest_check_start,)
 ).fetchall()
 for row in rows:
     print(f"    {row[0]}: {row[1]:,} 只")
@@ -67,10 +73,11 @@ except Exception as e:
 # data_fetcher 读取测试
 try:
     from src.data_fetcher import load_all_kline_sqlite, load_benchmark_kline, load_stock_info_sqlite
-    df = load_all_kline_sqlite("data/stock_data.db", start_date="2026-04-01", end_date="2026-04-30")
+    df = load_all_kline_sqlite("data/stock_data.db", start_date=latest_check_start, end_date=latest_daily_date)
     print(f"  [OK] load_all_kline_sqlite: {len(df):,} 行, {df['code'].nunique()} 只, cols={list(df.columns)}")
+    latest_index_date = sqlite3.connect("data/stock_data.db").execute("SELECT MAX(date) FROM index_data").fetchone()[0]
     bm = load_benchmark_kline("data/stock_data.db", index_code="000300",
-                               start_date="2026-04-01", end_date="2026-04-30")
+                               start_date=latest_check_start, end_date=latest_index_date)
     print(f"  [OK] load_benchmark_kline: {len(bm)} 行, latest={bm['date'].max()}")
     meta = load_stock_info_sqlite("data/stock_data.db")
     print(f"  [OK] load_stock_info_sqlite: {len(meta)} 只")
@@ -81,7 +88,7 @@ except Exception as e:
 # 指标+打分单股测试
 try:
     df1 = load_all_kline_sqlite("data/stock_data.db",
-                                 start_date="2025-10-01", end_date="2026-04-30")
+                                 start_date="2025-10-01", end_date=latest_daily_date)
     grp = df1[df1["code"] == "000001"].sort_values("date").reset_index(drop=True)
     df1_ind = add_all_indicators(
         grp,

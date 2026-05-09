@@ -292,6 +292,27 @@ def load_all_kline_sqlite(db_path: str,
     return df
 
 
+def get_latest_trade_date_sqlite(db_path: str,
+                                 table: str = "daily_data_hfq") -> Optional[str]:
+    """
+    Return latest available trade date in stock_data.db for the given table.
+    Returns None when the table is missing or contains no rows.
+    """
+    import sqlite3 as _sqlite3
+
+    con = _sqlite3.connect(db_path)
+    try:
+        row = con.execute(f"SELECT MAX(date) FROM {table}").fetchone()
+    except Exception:
+        con.close()
+        return None
+    con.close()
+
+    if not row:
+        return None
+    return row[0] or None
+
+
 def load_stock_info_sqlite(db_path: str) -> dict:
     """
     Load stock name + industry from stock_data.db (SQLite format).
@@ -359,6 +380,13 @@ def _bs_code(stock_code: str) -> str:
     return f"sz.{stock_code}"
 
 
+def _is_main_board_stock_code(stock_code: str) -> bool:
+    """Return True for strategy universe codes kept in stock_data.db."""
+    if not stock_code or len(stock_code) != 6 or not stock_code.isdigit():
+        return False
+    return stock_code.startswith(("000", "001", "002", "003", "600", "601", "603", "605"))
+
+
 def _fetch_batch_sqlite(args):
     """
     子进程：只拉取后复权（adjustflag=1）日线，返回 list of (stock_code, rows_list)。
@@ -419,31 +447,43 @@ def _safe_float(v):
 def _fetch_index_sqlite(index_bs_code: str, index_code: str,
                         start_date: str, end_date: str, retry: int = 3):
     """拉取指数日线，返回 DataFrame，columns: index_code, date, open, high, low, close, volume, amount。"""
-    for attempt in range(retry):
+    import baostock as _bs
+
+    lg = _bs.login()
+    if lg.error_code != "0":
+        return None
+
+    try:
+        for attempt in range(retry):
+            try:
+                rs = _bs.query_history_k_data_plus(
+                    index_bs_code,
+                    "date,open,high,low,close,volume,amount",
+                    start_date=start_date, end_date=end_date,
+                    frequency="d", adjustflag="3",
+                )
+                if rs.error_code != "0":
+                    time.sleep(0.5)
+                    continue
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                if not rows:
+                    return None
+                df = pd.DataFrame(rows, columns=["date", "open", "high", "low",
+                                                 "close", "volume", "amount"])
+                df["index_code"] = index_code
+                for col in ["open", "high", "low", "close", "volume", "amount"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                return df[["index_code", "date", "open", "high", "low", "close", "volume", "amount"]]
+            except Exception:
+                time.sleep(1)
+        return None
+    finally:
         try:
-            rs = bs.query_history_k_data_plus(
-                index_bs_code,
-                "date,open,high,low,close,volume,amount",
-                start_date=start_date, end_date=end_date,
-                frequency="d", adjustflag="3",
-            )
-            if rs.error_code != "0":
-                time.sleep(0.5)
-                continue
-            rows = []
-            while rs.next():
-                rows.append(rs.get_row_data())
-            if not rows:
-                return None
-            df = pd.DataFrame(rows, columns=["date", "open", "high", "low",
-                                             "close", "volume", "amount"])
-            df["index_code"] = index_code
-            for col in ["open", "high", "low", "close", "volume", "amount"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            return df[["index_code", "date", "open", "high", "low", "close", "volume", "amount"]]
+            _bs.logout()
         except Exception:
-            time.sleep(1)
-    return None
+            pass
 
 
 def update_stock_data(db_path: str,
@@ -484,7 +524,10 @@ def update_stock_data(db_path: str,
         "SELECT stock_code, MAX(date) FROM daily_data_hfq GROUP BY stock_code"
     ).fetchall())
 
-    all_codes = [r[0] for r in con.execute("SELECT stock_code FROM stock_info").fetchall()]
+    all_codes = [
+        stock_code for (stock_code,) in con.execute("SELECT stock_code FROM stock_info").fetchall()
+        if _is_main_board_stock_code(stock_code)
+    ]
     con.close()
 
     from datetime import timedelta
