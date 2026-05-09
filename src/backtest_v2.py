@@ -42,6 +42,9 @@ def _simulate_exit(
     take_profit: float,
     break_down_pct: float,
     max_hold: int,
+    stop_loss_mode: str = "close",
+    fail_exit_days: int = 0,
+    fail_exit_min_return: float = 0.0,
 ) -> Optional[Tuple[int, float, str]]:
     """
     对单笔交易做前向扫描，返回 (exit_idx, exit_price, reason)。
@@ -74,8 +77,11 @@ def _simulate_exit(
         if not np.isfinite(c):
             continue
 
-        # 1. 破位止损（按收盘判定）
-        if np.isfinite(c) and c <= sl_price:
+        # 1. 破位止损
+        if stop_loss_mode == "intraday":
+            if np.isfinite(l) and l <= sl_price:
+                return (i, float(sl_price), "破位止损(日内)")
+        elif np.isfinite(c) and c <= sl_price:
             return (i, float(c), "破位止损")
 
         # 2. 固定止盈：当日 high 突破 tp_price
@@ -86,7 +92,13 @@ def _simulate_exit(
         if np.isfinite(bbu) and c >= bbu:
             return (i, float(c), "止盈(布林上轨)")
 
-    # 4. 超时（持有满 max_hold）
+        # 4. 短期失效退出：持有达到指定天数仍未达最低收益，按收盘离场
+        if fail_exit_days > 0 and (i - buy_idx) >= fail_exit_days:
+            curr_ret = (c - buy_price) / buy_price
+            if curr_ret <= fail_exit_min_return:
+                return (i, float(c), "失效退出(%dd)" % fail_exit_days)
+
+    # 5. 超时（持有满 max_hold）
     last_close = close_arr[end_idx]
     if not np.isfinite(last_close) or last_close <= 0:
         return None
@@ -138,6 +150,13 @@ def run_backtest_v2(
     signal_freq: str = "biweekly",
     min_history: int = 60,
     max_concurrent: int = 0,  # 0 = 不限并发
+    stop_loss_mode: str = "close",
+    fail_exit_days: int = 0,
+    fail_exit_min_return: float = 0.0,
+    min_candle_score: int = 0,
+    min_vol_score: int = 0,
+    min_total_score: int | None = None,
+    require_rsi_or_kdj_score_sum: int = 0,
 ) -> Dict[str, Any]:
     """
     高性能回测 v2。出场规则见模块 docstring。
@@ -154,9 +173,17 @@ def run_backtest_v2(
     require_all_dimensions = score_cfg.get("require_all_dimensions", True)
     require_rsi_divergence = score_cfg.get("require_rsi_divergence", False)
     rsi_long_oversold      = score_cfg.get("rsi_long_oversold", 40)
+    strong_confirmation_threshold = score_cfg.get("strong_confirmation_threshold")
+    weak_confirmation_threshold = score_cfg.get("weak_confirmation_threshold")
+    score_min_candle = score_cfg.get("min_candle_score", 0)
+    score_min_vol = score_cfg.get("min_vol_score", 0)
+    score_min_total = score_cfg.get("min_total_score")
+    score_rsi_kdj_sum = score_cfg.get("require_rsi_or_kdj_score_sum", 0)
 
     print(f"[v2] 回测区间: {start_date} ~ {end_date}")
-    print(f"[v2] 出场规则: TP=+{take_profit*100:.0f}% 或 触布林上轨 | SL=破位 -{break_down_pct*100:.0f}% | 最长 {max_hold} 日")
+    print(f"[v2] 出场规则: TP=+{take_profit*100:.0f}% 或 触布林上轨 | SL({stop_loss_mode})=-{break_down_pct*100:.0f}% | 最长 {max_hold} 日")
+    if fail_exit_days > 0:
+        print(f"[v2] 失效退出: 持有≥{fail_exit_days}日且收益≤{fail_exit_min_return:.1%}")
 
     # ── 1. 全市场交易日（用于信号日采样）──────────────────────
     trading_dates = sorted(all_kline["date"].unique())
@@ -240,7 +267,18 @@ def run_backtest_v2(
             except Exception:
                 continue
             s["code"] = code
-            if not is_selected(s, threshold, require_all_dimensions, require_rsi_divergence):
+            if not is_selected(
+                s,
+                threshold,
+                require_all_dimensions,
+                require_rsi_divergence,
+                strong_confirmation_threshold=strong_confirmation_threshold,
+                weak_confirmation_threshold=weak_confirmation_threshold,
+                min_candle_score=max(score_min_candle, min_candle_score),
+                min_vol_score=max(score_min_vol, min_vol_score),
+                min_total_score=min_total_score if min_total_score is not None else score_min_total,
+                require_rsi_or_kdj_score_sum=max(score_rsi_kdj_sum, require_rsi_or_kdj_score_sum),
+            ):
                 continue
             candidates.append(s)
 
@@ -267,6 +305,9 @@ def run_backtest_v2(
                 take_profit=take_profit,
                 break_down_pct=break_down_pct,
                 max_hold=max_hold,
+                stop_loss_mode=stop_loss_mode,
+                fail_exit_days=fail_exit_days,
+                fail_exit_min_return=fail_exit_min_return,
             )
             if res is None:
                 continue
@@ -335,8 +376,9 @@ def _aggregate_metrics(df: pd.DataFrame, take_profit: float,
     win = (rets > 0).sum()
     tp_pct  = df["exit_reason"].str.startswith("止盈(+").sum()
     tp_boll = (df["exit_reason"] == "止盈(布林上轨)").sum()
-    sl_cnt  = (df["exit_reason"] == "破位止损").sum()
+    sl_cnt  = df["exit_reason"].str.startswith("破位止损").sum()
     to_cnt  = df["exit_reason"].str.startswith("超时").sum()
+    fail_cnt = df["exit_reason"].str.startswith("失效退出").sum()
 
     return {
         "total_trades":  n,
@@ -346,6 +388,7 @@ def _aggregate_metrics(df: pd.DataFrame, take_profit: float,
         "tp_boll_rate":  round(tp_boll / n, 4),
         "sl_rate":       round(sl_cnt / n, 4),
         "timeout_rate":  round(to_cnt / n, 4),
+        "fail_exit_rate": round(fail_cnt / n, 4),
         "mean_return":   round(float(rets.mean()), 4),
         "median_return": round(float(rets.median()), 4),
         "max_return":    round(float(rets.max()), 4),

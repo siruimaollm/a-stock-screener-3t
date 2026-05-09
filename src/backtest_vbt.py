@@ -30,11 +30,21 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ─────────────────────────────────────────────
 
 def _get_signal_dates(trade_dates: list[str], freq: str = "biweekly") -> list[str]:
+    if freq == "daily":
+        return list(trade_dates)
+
     signals, seen = [], set()
     for d in trade_dates:
         dt = datetime.strptime(d, "%Y-%m-%d")
-        key = (dt.year, dt.month) if freq == "monthly" \
-              else (dt.year, dt.month, 1 if dt.day <= 15 else 2)
+        if freq == "monthly":
+            key = (dt.year, dt.month)
+        elif freq == "weekly":
+            iso = dt.isocalendar()
+            key = (iso.year, iso.week)
+        elif freq == "biweekly":
+            key = (dt.year, dt.month, 1 if dt.day <= 15 else 2)
+        else:
+            raise ValueError(f"Unsupported signal_freq: {freq}")
         if key not in seen:
             signals.append(d)
             seen.add(key)
@@ -104,6 +114,12 @@ def run_vbt_backtest(
             require_all_dimensions=score_cfg.get("require_all_dimensions", True),
             require_rsi_divergence=score_cfg.get("require_rsi_divergence", False),
             rsi_long_oversold=score_cfg.get("rsi_long_oversold", 40),
+            strong_confirmation_threshold=score_cfg.get("strong_confirmation_threshold"),
+            weak_confirmation_threshold=score_cfg.get("weak_confirmation_threshold"),
+            min_candle_score=score_cfg.get("min_candle_score", 0),
+            min_vol_score=score_cfg.get("min_vol_score", 0),
+            min_total_score=score_cfg.get("min_total_score"),
+            require_rsi_or_kdj_score_sum=score_cfg.get("require_rsi_or_kdj_score_sum", 0),
         )
         if not picks:
             continue

@@ -38,6 +38,7 @@ scoring:
   require_rsi_divergence: false
   rsi_long_oversold: 35
   threshold: 6
+  weak_confirmation_threshold: 7
 tuner:
   amp30_candidates:
   - 0.12
@@ -59,6 +60,10 @@ universe:
   exclude_st: true
   min_listed_days: 60
 volatility:
+  directional_vol_shrink: true
+  vol_shrink_short_window: 10
+  vol_shrink_long_window: 60
+  vol_shrink_ratio: 0.8
   amp30_min: 0.12
   atr_pct_ratio: 1.2
   bb_width_quantile: 0.65

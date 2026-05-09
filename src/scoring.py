@@ -48,9 +48,13 @@ Layer 2 — 五维共振评分体系（重构版，满分 15 分）
 ============================================================
 入选标准（总分满分15）：
   ① BOLL维度 ≥ 1（必须触及下轨，不满足直接淘汰）
-  ② 量价止跌确认（三档任一）：
-       vol≥2  OR  candle≥3  OR  (vol≥1 AND candle≥2)
-  ③ total_score ≥ 9
+  ② 量价/蜡烛确认分层：
+       强确认: vol≥2 OR candle≥3 OR (vol≥1 AND candle≥2)
+       弱确认: candle≥2 OR (vol≥1 AND candle≥1)
+       无确认: 其余情况，直接淘汰
+  ③ total_score 达到分层门槛：
+       强确认: 默认 total_score ≥ threshold
+       弱确认: 默认 total_score ≥ threshold + 1
   排序：total_score DESC，candle_score DESC，rsi底背离优先
 """
 import numpy as np
@@ -347,6 +351,37 @@ def score_candle(df: pd.DataFrame) -> tuple:
     return 0, []
 
 
+def get_confirmation_tier(scores: dict) -> str:
+    """将量价/蜡烛确认拆为 strong / weak / none 三档。"""
+    vol = int(scores.get("vol_score", 0) or 0)
+    candle = int(scores.get("candle_score", 0) or 0)
+
+    if (vol >= 2) or (candle >= 3) or (vol >= 1 and candle >= 2):
+        return "strong"
+    if (candle >= 2) or (vol >= 1 and candle >= 1):
+        return "weak"
+    return "none"
+
+
+def get_confirmation_threshold(scores: dict, threshold: int = 9,
+                               strong_confirmation_threshold: int | None = None,
+                               weak_confirmation_threshold: int | None = None) -> int | None:
+    """根据确认档位返回所需总分门槛；无确认返回 None。"""
+    strong_thr = int(threshold if strong_confirmation_threshold is None
+                     else strong_confirmation_threshold)
+    weak_thr = int((threshold + 1) if weak_confirmation_threshold is None
+                   else weak_confirmation_threshold)
+    if weak_thr < strong_thr:
+        weak_thr = strong_thr
+
+    tier = get_confirmation_tier(scores)
+    if tier == "strong":
+        return strong_thr
+    if tier == "weak":
+        return weak_thr
+    return None
+
+
 # ─────────────────────────────────────────────
 #  汇总评分
 # ─────────────────────────────────────────────
@@ -356,6 +391,7 @@ def score_stock(df: pd.DataFrame, rsi_long_oversold: float = 40) -> dict:
     result = {
         "boll_score": 0, "rsi_score": 0, "kdj_score": 0,
         "vol_score": 0, "candle_score": 0, "total_score": 0,
+        "confirmation_tier": "none",
         "has_divergence": False, "signals": [],
         "rsi6": np.nan, "rsi12": np.nan, "rsi24": np.nan,
         "K": np.nan, "D": np.nan, "J": np.nan,
@@ -389,6 +425,7 @@ def score_stock(df: pd.DataFrame, rsi_long_oversold: float = 40) -> dict:
     result["vol_score"]    = vol
     result["candle_score"] = candle
     result["total_score"]  = boll + rsi + kdj + vol + candle
+    result["confirmation_tier"] = get_confirmation_tier(result)
     result["has_divergence"] = has_div
     result["signals"] = sig_b + sig_r + sig_k + sig_v + sig_c
     return result
@@ -396,30 +433,53 @@ def score_stock(df: pd.DataFrame, rsi_long_oversold: float = 40) -> dict:
 
 def is_selected(scores: dict, threshold: int = 9,
                 require_all_dimensions: bool = True,
-                require_rsi_divergence: bool = False) -> bool:
+                require_rsi_divergence: bool = False,
+                strong_confirmation_threshold: int | None = None,
+                weak_confirmation_threshold: int | None = None,
+                min_candle_score: int = 0,
+                min_vol_score: int = 0,
+                min_total_score: int | None = None,
+                require_rsi_or_kdj_score_sum: int = 0) -> bool:
     """
     入选标准（5维满分15）：
       ① boll_score ≥ 1（必须触及下轨，硬性必要条件）
-      ② 量价止跌确认（三档任一达标）：
-           vol_score ≥ 2  ← 明显止跌（持续缩量/缩量后放量阳线）
-         OR candle_score ≥ 3  ← 极强金针探底
-         OR (vol_score ≥ 1 AND candle_score ≥ 2)  ← 温和缩量+锤子线组合
-      ③ total_score ≥ threshold（默认9）
+      ② 量价/蜡烛确认需至少达到 weak：
+           strong: vol≥2 OR candle≥3 OR (vol≥1 AND candle≥2)
+           weak:   candle≥2 OR (vol≥1 AND candle≥1)
+           none:   直接淘汰
+      ③ total_score 达到对应确认档位门槛：
+           strong: ≥ strong_confirmation_threshold（默认 threshold）
+           weak:   ≥ weak_confirmation_threshold（默认 threshold + 1）
       require_rsi_divergence=True 时额外要求底背离（默认不强制）
     """
     # ① BOLL硬性条件
     if scores.get("boll_score", 0) < 1:
         return False
 
-    # ② 量价止跌确认（三档达标）
-    vol    = scores.get("vol_score", 0)
-    candle = scores.get("candle_score", 0)
-    vol_candle_ok = (vol >= 2) or (candle >= 3) or (vol >= 1 and candle >= 2)
-    if not vol_candle_ok:
+    if scores.get("candle_score", 0) < min_candle_score:
+        return False
+
+    if scores.get("vol_score", 0) < min_vol_score:
+        return False
+
+    if min_total_score is not None and scores.get("total_score", 0) < min_total_score:
+        return False
+
+    if (scores.get("rsi_score", 0) + scores.get("kdj_score", 0)) < require_rsi_or_kdj_score_sum:
+        return False
+
+    # ② 量价/蜡烛确认分层
+    required_threshold = get_confirmation_threshold(
+        scores,
+        threshold=threshold,
+        strong_confirmation_threshold=strong_confirmation_threshold,
+        weak_confirmation_threshold=weak_confirmation_threshold,
+    )
+    if required_threshold is None:
         return False
 
     # ③ 总分门槛
-    if scores["total_score"] < threshold:
+    if scores["total_score"] < required_threshold:
         return False
 
     # 可选：底背离
@@ -432,12 +492,30 @@ def is_selected(scores: dict, threshold: int = 9,
 def score_all(stock_data: dict, threshold: int = 10,
               require_all_dimensions: bool = True,
               require_rsi_divergence: bool = False,
-              rsi_long_oversold: float = 40, **kwargs) -> list:
+              rsi_long_oversold: float = 40,
+              strong_confirmation_threshold: int | None = None,
+              weak_confirmation_threshold: int | None = None,
+              min_candle_score: int = 0,
+              min_vol_score: int = 0,
+              min_total_score: int | None = None,
+              require_rsi_or_kdj_score_sum: int = 0,
+              **kwargs) -> list:
     selected = []
     for code, df in stock_data.items():
         s = score_stock(df, rsi_long_oversold=rsi_long_oversold)
         s["code"] = code
-        if is_selected(s, threshold, require_all_dimensions, require_rsi_divergence):
+        if is_selected(
+            s,
+            threshold,
+            require_all_dimensions,
+            require_rsi_divergence,
+            strong_confirmation_threshold=strong_confirmation_threshold,
+            weak_confirmation_threshold=weak_confirmation_threshold,
+            min_candle_score=min_candle_score,
+            min_vol_score=min_vol_score,
+            min_total_score=min_total_score,
+            require_rsi_or_kdj_score_sum=require_rsi_or_kdj_score_sum,
+        ):
             selected.append(s)
 
     # 排序：总分 > 底背离 > 蜡烛形态 > KDJ

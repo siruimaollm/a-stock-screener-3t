@@ -53,6 +53,12 @@ def run_backtest(all_kline: pd.DataFrame,
     require_all_dimensions = score_cfg.get("require_all_dimensions", True)
     require_rsi_divergence = score_cfg.get("require_rsi_divergence", False)
     rsi_long_oversold = score_cfg.get("rsi_long_oversold", 40)
+    strong_confirmation_threshold = score_cfg.get("strong_confirmation_threshold")
+    weak_confirmation_threshold = score_cfg.get("weak_confirmation_threshold")
+    min_candle_score = score_cfg.get("min_candle_score", 0)
+    min_vol_score = score_cfg.get("min_vol_score", 0)
+    min_total_score = score_cfg.get("min_total_score")
+    require_rsi_or_kdj_score_sum = score_cfg.get("require_rsi_or_kdj_score_sum", 0)
 
     trading_dates = _trading_dates(all_kline)
     # Precompute date → index lookup (O(1) lookups)
@@ -127,7 +133,18 @@ def run_backtest(all_kline: pd.DataFrame,
             except Exception:
                 continue
             s["code"] = code
-            if is_selected(s, threshold, require_all_dimensions, require_rsi_divergence):
+            if is_selected(
+                s,
+                threshold,
+                require_all_dimensions,
+                require_rsi_divergence,
+                strong_confirmation_threshold=strong_confirmation_threshold,
+                weak_confirmation_threshold=weak_confirmation_threshold,
+                min_candle_score=min_candle_score,
+                min_vol_score=min_vol_score,
+                min_total_score=min_total_score,
+                require_rsi_or_kdj_score_sum=require_rsi_or_kdj_score_sum,
+            ):
                 candidates.append(s)
 
         candidates.sort(key=lambda x: x["total_score"], reverse=True)

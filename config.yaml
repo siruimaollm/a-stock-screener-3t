@@ -30,7 +30,10 @@ volatility:
   range_max_pct: 0.20                  # 近30日价格区间/均价 ≤ 20%
   drawdown_min: 0.40                   # 当前价 ≥ 60日高点×40%
   drawdown_max: 0.90                   # 当前价 ≤ 60日高点×90%
-  vol_shrink_ratio: 0.80               # 近10日均量 < 近30日均量×0.80
+  directional_vol_shrink: true         # 第一层只做方向性缩量判断，避免与第二层重复惩罚
+  vol_shrink_short_window: 10          # 短周期均量窗口
+  vol_shrink_long_window: 60           # 长周期均量窗口
+  vol_shrink_ratio: 0.80               # 兼容旧逻辑；directional_vol_shrink=false 时生效
   atr_shrink_ratio: 0.85               # 近10日ATR < 近30日ATR×0.85
 
   # 第三段：当前未在急跌
@@ -47,10 +50,15 @@ volatility:
 # 必要条件：BOLL≥1（触及下轨）+ 量价≥1 或 蜡烛≥2
 # 总分 ≥ 10 入选
 scoring:
-  threshold: 7                         # 总分 ≥ 7（满分15，~47%）— 优化后阈值
+  threshold: 8                         # 强确认总分门槛（优化后默认）
+  weak_confirmation_threshold: 9       # 弱确认需要更高总分
   require_all_dimensions: true         # 保留兼容接口
   require_rsi_divergence: false        # RSI底背离为加分项，非硬性要求（得分已体现）
   rsi_long_oversold: 40                # RSI6 < 40 视为超卖
+  min_candle_score: 1                  # 剔除 candle_score=0 的弱反转票
+  min_vol_score: 0
+  min_total_score: null
+  require_rsi_or_kdj_score_sum: 1      # 至少保留一项反转动量确认
 
 # ==================== 指标参数(用户指定) ====================
 indicators:
@@ -93,6 +101,13 @@ backtest_v2:
   break_down_pct: 0.08           # 破位止损阈值（8%）
   max_hold:       252            # 最长持有交易日（≈1年）
   signal_freq:    "biweekly"     # 信号扫描频率：weekly / biweekly / monthly / daily
+  stop_loss_mode: "intraday"     # close=收盘破位止损, intraday=日内触价止损
+  fail_exit_days: 8              # 最优实验结果：持有 8 日仍未转正则失效退出
+  fail_exit_min_return: 0.0      # 与 fail_exit_days 配合使用
+  min_candle_score: 0            # 选股过滤已放入 scoring；此处保留兼容
+  min_vol_score: 0               # 回测实验用：最低量价分
+  min_total_score: null          # 回测实验用：额外最低总分
+  require_rsi_or_kdj_score_sum: 0  # 选股过滤已放入 scoring；此处保留兼容
 
 # ==================== 妙想 API ====================
 miao:

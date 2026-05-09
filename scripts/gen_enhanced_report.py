@@ -9,14 +9,21 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
-from src.data_fetcher import load_all_kline_sqlite, load_stock_info_sqlite
+from src.data_fetcher import (
+    get_latest_trade_date_sqlite,
+    load_all_kline_sqlite,
+    load_stock_info_sqlite,
+)
 from src.indicators import add_all_indicators
 from src.volatility_filter import passes_volatility
-from src.scoring import score_stock, is_selected
+from src.scoring import score_stock, is_selected, get_confirmation_threshold
 from src.report_html import _kline_chart
 
-# Use last normal trading day (before holiday distortion)
-pick_date = "2026-04-30"
+sqlite_path = cfg["data"].get("stock_data_db", "data/stock_data.db")
+pick_date = get_latest_trade_date_sqlite(sqlite_path, table="daily_data_hfq")
+if not pick_date:
+    raise RuntimeError("Could not resolve latest trade date from stock_data.db")
+
 since = (datetime.strptime(pick_date, "%Y-%m-%d") - timedelta(days=200)).strftime("%Y-%m-%d")
 
 v = cfg["volatility"]
@@ -30,11 +37,12 @@ vol_cfg = {
     "cum_5d_min": v.get("cum_5d_min", -0.10),
 }
 threshold = cfg["scoring"]["threshold"]
+weak_threshold = cfg["scoring"].get("weak_confirmation_threshold", threshold + 1)
 rsi_oversold = cfg["scoring"].get("rsi_long_oversold", 40)
-meta = load_stock_info_sqlite("data/stock_data.db")
+meta = load_stock_info_sqlite(sqlite_path)
 
 print("Loading kline data...")
-all_kline = load_all_kline_sqlite("data/stock_data.db", start_date=since, end_date=pick_date)
+all_kline = load_all_kline_sqlite(sqlite_path, start_date=since, end_date=pick_date)
 print(f"  {len(all_kline)} rows, {all_kline['code'].nunique()} stocks")
 
 stock_data = {}
@@ -61,7 +69,11 @@ scored = []
 for code, df in filtered.items():
     s = score_stock(df, rsi_long_oversold=rsi_oversold)
     s["code"] = code
-    s["selected"] = is_selected(s, threshold)
+    s["selected"] = is_selected(
+        s,
+        threshold,
+        weak_confirmation_threshold=weak_threshold,
+    )
     scored.append(s)
 scored.sort(key=lambda x: x["total_score"], reverse=True)
 
@@ -92,8 +104,11 @@ for i, s in enumerate(scored[:20]):
     info = meta.get(code, {})
     name = info.get("name", code)
     industry = info.get("industry", "")
-    v_ok = ((s["vol_score"] >= 2) or (s["candle_score"] >= 3)
-            or (s["vol_score"] >= 1 and s["candle_score"] >= 2))
+    confirm_threshold = get_confirmation_threshold(
+        s,
+        threshold=threshold,
+        weak_confirmation_threshold=weak_threshold,
+    )
 
     if s["selected"]:
         sel_icon = "&#x2714; 入选"
@@ -105,10 +120,10 @@ for i, s in enumerate(scored[:20]):
     fail_parts = []
     if s["boll_score"] < 1:
         fail_parts.append("无BOLL下轨触及")
-    if not v_ok:
-        fail_parts.append(f"量价确认不足(vol={s['vol_score']},K线={s['candle_score']})")
-    if s["total_score"] < threshold:
-        fail_parts.append(f"总分{s['total_score']}&lt;{threshold}")
+    if confirm_threshold is None:
+        fail_parts.append(f"量价/蜡烛确认不足(量价={s['vol_score']},K线={s['candle_score']})")
+    elif s["total_score"] < confirm_threshold:
+        fail_parts.append(f"总分{s['total_score']}&lt;{confirm_threshold}({s.get('confirmation_tier','none')}确认)")
     fail_str = " / ".join(fail_parts) if fail_parts else "通过全部条件"
 
     close_v = f"{float(s['close']):.2f}" if s["close"] == s["close"] else "-"
@@ -179,16 +194,16 @@ code {{ background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 12
 <body>
 <h1>A股主板 RSI+KDJ+布林三指标共振反转策略 — 选股报告</h1>
 <div class="summary">
-  <b>数据截止：</b>{pick_date}（五一节前最后交易日）&nbsp;|&nbsp;
-  <b>严格入选（total≥{threshold}）：</b><b style="color:{'green' if len(strict_picks)>0 else '#e67e22'}">{len(strict_picks)} 只</b>&nbsp;|&nbsp;
+  <b>数据截止：</b>{pick_date}&nbsp;|&nbsp;
+  <b>严格入选：</b><b style="color:{'green' if len(strict_picks)>0 else '#e67e22'}">{len(strict_picks)} 只</b>&nbsp;|&nbsp;
   <b>通过波动率过滤：</b>{len(filtered)} / {len(stock_data)} 只&nbsp;|&nbsp;
   <b>生成时间：</b>{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 </div>
 <div class="legend">
   <b>策略三层过滤：</b><br>
-  ① <b>三段波动率过滤</b>：历史(60~25日前)曾大涨放量 → 近30日缩量横盘 → 近5日未急跌<br>
+  ① <b>三段波动率过滤</b>：历史(60~25日前)曾大涨放量 → 近30日整理收敛 + 10日均量&lt;60日均量 → 近5日未急跌<br>
   ② <b>五维打分</b>（满分15）：BOLL触下轨(0~3) + RSI超卖(0~3) + KDJ金叉(0~3) + 量价止跌(0~3) + 蜡烛形态(0~3)<br>
-  ③ <b>入选门槛</b>：BOLL≥1（必须）+ 量价确认（vol≥2 或 K线≥3 或 vol≥1+K线≥2）+ 总分≥{threshold}
+  ③ <b>入选门槛</b>：BOLL≥1（必须）+ 至少弱确认；强确认总分≥{threshold}，弱确认总分≥{weak_threshold}
 </div>
 {note}
 <h2>候选股汇总（通过波动率过滤，按总分排序，显示前20）</h2>
@@ -209,7 +224,7 @@ code {{ background: #f0f0f0; padding: 2px 5px; border-radius: 3px; font-size: 12
 </body>
 </html>"""
 
-out_path = "output/report_20260430_enhanced.html"
+out_path = f"output/report_{pick_date.replace('-', '')}_enhanced.html"
 with open(out_path, "w", encoding="utf-8") as f:
     f.write(html)
 print(f"\n[OK] Enhanced report saved: {out_path}")
